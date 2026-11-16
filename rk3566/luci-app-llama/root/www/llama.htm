@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<meta name="theme-color" content="#0d1117">
+<title>本地 AI 助手</title>
+<style>
+  :root{
+    --bg:#0b0f14; --bg2:#0d1117; --panel:#151b23; --panel2:#1b222c;
+    --border:#232c38; --border2:#2d3846;
+    --text:#d7dde5; --dim:#8b96a5; --dim2:#5f6b7a;
+    --accent:#4a9eff; --accent2:#2f7fe0; --accent-soft:rgba(74,158,255,.14);
+    --ok:#3fb950; --warn:#d29922; --err:#f85149;
+    --radius:14px;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  [hidden]{display:none!important}
+  html,body{margin:0;height:100%;background:
+    radial-gradient(1200px 600px at 50% -20%, #14202e 0%, transparent 60%), var(--bg);
+    color:var(--text);font:15px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased}
+  #app{display:flex;flex-direction:column;height:100dvh;max-width:900px;margin:0 auto}
+
+  header{display:flex;align-items:center;justify-content:space-between;gap:10px;
+    padding:12px 18px;border-bottom:1px solid var(--border);
+    background:rgba(21,27,35,.86);backdrop-filter:blur(12px);
+    position:sticky;top:0;z-index:5;flex-wrap:wrap}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:650;letter-spacing:.2px;font-size:15px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--dim2);flex:0 0 auto;
+    box-shadow:0 0 0 3px rgba(95,107,122,.16);transition:.3s}
+  .dot.ok{background:var(--ok);box-shadow:0 0 0 3px rgba(63,185,80,.18)}
+  .dot.load{background:var(--warn);box-shadow:0 0 0 3px rgba(210,153,34,.18);animation:pulse 1.3s infinite}
+  .dot.err{background:var(--err);box-shadow:0 0 0 3px rgba(248,81,73,.18)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  .meta{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim)}
+  .tag{display:inline-flex;align-items:center;gap:5px;padding:4px 9px;border-radius:8px;
+    background:var(--panel2);border:1px solid var(--border);color:var(--dim);font-size:11.5px;
+    max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tag b{color:var(--text);font-weight:500}
+  .ibtn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;
+    border-radius:9px;background:var(--panel2);border:1px solid var(--border);color:var(--dim);
+    cursor:pointer;transition:.16s}
+  .ibtn:hover{background:#212a35;border-color:var(--border2);color:var(--text)}
+  .ibtn:active{transform:scale(.94)}
+  .ibtn svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.9;
+    stroke-linecap:round;stroke-linejoin:round}
+
+  main{flex:1;overflow-y:auto;padding:22px 18px 10px;scroll-behavior:smooth}
+  main::-webkit-scrollbar{width:8px}
+  main::-webkit-scrollbar-thumb{background:#2a3542;border-radius:4px}
+  main::-webkit-scrollbar-track{background:transparent}
+
+  .msg{display:flex;margin-bottom:18px;gap:11px;align-items:flex-start;
+    animation:rise .28s cubic-bezier(.2,.8,.3,1) both}
+  @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  .msg .who{flex:0 0 30px;height:30px;border-radius:10px;display:grid;place-items:center;
+    font-size:11.5px;font-weight:700;background:var(--panel2);border:1px solid var(--border);
+    color:var(--dim)}
+  .msg.user{flex-direction:row-reverse}
+  .msg.user .who{background:linear-gradient(135deg,var(--accent),var(--accent2));
+    border-color:transparent;color:#fff}
+  .bubble{max-width:min(80%,660px);padding:11px 15px;border-radius:var(--radius);
+    background:var(--panel);border:1px solid var(--border);white-space:pre-wrap;
+    word-break:break-word;overflow-wrap:anywhere;box-shadow:0 1px 2px rgba(0,0,0,.22)}
+  .msg.user .bubble{background:linear-gradient(135deg,var(--accent),var(--accent2));
+    border-color:transparent;color:#fff;border-bottom-right-radius:5px;
+    box-shadow:0 2px 10px rgba(47,127,224,.22)}
+  .msg.bot .bubble{border-bottom-left-radius:5px}
+  .bubble code{background:#0a0e13;border:1px solid var(--border);border-radius:5px;
+    padding:1.5px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.88em}
+  .bubble pre{position:relative;background:#0a0e13;border:1px solid var(--border);border-radius:10px;
+    padding:12px 14px;overflow-x:auto;margin:9px 0}
+  .bubble pre code{background:none;border:0;padding:0;font-size:.87em;line-height:1.55}
+  .bubble pre .copy{position:absolute;top:6px;right:6px;font-size:11px;padding:3px 8px;
+    border-radius:6px;background:#1b222c;border:1px solid var(--border2);color:var(--dim);
+    cursor:pointer;opacity:0;transition:.15s}
+  .bubble pre:hover .copy{opacity:1}
+  .bubble pre .copy:hover{color:var(--accent);border-color:var(--accent)}
+  .bubble ul,.bubble ol{margin:6px 0;padding-left:20px}
+  .bubble li{margin:3px 0}
+  .caret{display:inline-block;width:7px;height:15px;vertical-align:-2px;
+    background:var(--accent);animation:blink 1s steps(2) infinite;border-radius:1px}
+  @keyframes blink{50%{opacity:0}}
+
+  .typing{display:inline-flex;gap:4px;align-items:center;height:20px}
+  .typing i{width:6px;height:6px;border-radius:50%;background:var(--accent);opacity:.35;
+    animation:dip 1.15s infinite ease-in-out}
+  .typing i:nth-child(2){animation-delay:.16s}
+  .typing i:nth-child(3){animation-delay:.32s}
+  @keyframes dip{0%,80%,100%{opacity:.28;transform:translateY(0)}40%{opacity:1;transform:translateY(-3px)}}
+
+  .welcome{text-align:center;padding:46px 12px 24px;color:var(--dim);font-size:13.5px}
+  .welcome .logo{width:56px;height:56px;margin:0 auto 16px;border-radius:17px;
+    background:linear-gradient(140deg,rgba(74,158,255,.22),rgba(47,127,224,.06));
+    border:1px solid rgba(74,158,255,.3);display:grid;place-items:center}
+  .welcome .logo svg{width:26px;height:26px;stroke:var(--accent);fill:none;stroke-width:1.7;
+    stroke-linecap:round;stroke-linejoin:round}
+  .welcome h3{margin:0 0 7px;font-size:18px;font-weight:650;color:var(--text);
+    background:linear-gradient(90deg,#e8eef6,#9dc4ee);-webkit-background-clip:text;
+    background-clip:text;-webkit-text-fill-color:transparent}
+  .chips{margin-top:20px;display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+  .chip{padding:8px 14px;border-radius:11px;background:var(--panel);border:1px solid var(--border);
+    color:var(--text);font-size:12.5px;cursor:pointer;transition:.16s;text-align:left;max-width:100%}
+  .chip:hover{border-color:var(--accent);background:var(--accent-soft);transform:translateY(-1px)}
+  .chip:active{transform:none}
+
+  footer{display:flex;gap:9px;align-items:flex-end;padding:11px 18px 14px;
+    border-top:1px solid var(--border);background:rgba(21,27,35,.92);
+    backdrop-filter:blur(12px);position:sticky;bottom:0;
+    padding-bottom:calc(14px + env(safe-area-inset-bottom))}
+  .inputwrap{flex:1;position:relative;display:flex}
+  #input{flex:1;resize:none;max-height:140px;min-height:44px;padding:11px 14px;
+    border-radius:13px;border:1px solid var(--border);background:var(--panel2);
+    color:var(--text);font:inherit;outline:none;transition:.18s;line-height:1.5}
+  #input::placeholder{color:var(--dim2)}
+  #input:focus{border-color:rgba(74,158,255,.55);background:#0f151c;
+    box-shadow:0 0 0 3px rgba(74,158,255,.1)}
+  #send,#stop{border:0;border-radius:13px;font-weight:650;font-size:14px;cursor:pointer;
+    color:#fff;transition:.16s;flex:0 0 auto;height:44px;padding:0 20px;
+    display:inline-flex;align-items:center;gap:6px}
+  #send svg,#stop svg{width:16px;height:16px;stroke:#fff;fill:none;stroke-width:2;
+    stroke-linecap:round;stroke-linejoin:round}
+  #send{background:linear-gradient(135deg,var(--accent),var(--accent2));
+    box-shadow:0 2px 12px rgba(47,127,224,.3)}
+  #send:disabled{opacity:.4;cursor:not-allowed;box-shadow:none}
+  #send:active:not(:disabled){transform:scale(.97)}
+  #stop{background:linear-gradient(135deg,#f85149,#cf3030)}
+
+  .hint{padding:0 18px 7px;font-size:10.5px;color:var(--dim2);text-align:center;letter-spacing:.3px}
+
+  #scrollBtn{position:fixed;right:18px;bottom:86px;width:38px;height:38px;border-radius:50%;
+    background:var(--panel2);border:1px solid var(--border2);color:var(--text);cursor:pointer;
+    display:none;place-items:center;box-shadow:0 4px 14px rgba(0,0,0,.35);z-index:6;transition:.18s}
+  #scrollBtn.show{display:grid}
+  #scrollBtn svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2;
+    stroke-linecap:round;stroke-linejoin:round}
+
+  #toast{position:fixed;left:50%;bottom:96px;transform:translateX(-50%) translateY(16px);
+    background:#222c38;border:1px solid var(--border2);color:var(--text);padding:10px 17px;
+    border-radius:11px;font-size:13px;opacity:0;pointer-events:none;transition:.24s;z-index:20;
+    box-shadow:0 6px 20px rgba(0,0,0,.4);max-width:86vw}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+  @media(max-width:600px){
+    header{padding:10px 13px}
+    main{padding:16px 13px 6px}
+    .bubble{max-width:84%}
+    footer{padding:9px 13px;padding-bottom:calc(11px + env(safe-area-inset-bottom))}
+    #send,#stop{padding:0 16px}
+    .tag{max-width:120px}
+    .welcome{padding:32px 8px 18px}
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand"><span class="dot" id="dot"></span>本地 AI 助手</div>
+    <div class="meta">
+      <span class="tag" id="model">连接中…</span>
+      <span class="tag" id="tps" style="display:none"></span>
+      <button class="ibtn" id="keybtn" title="访问口令" aria-label="访问口令">
+        <svg viewBox="0 0 24 24"><path d="M15 7a4 4 0 1 0-4 4M12 11l-8 8v3h3l1-1v-2h2v-2h2l1-1"/></svg>
+      </button>
+      <button class="ibtn" id="clear" title="清空对话" aria-label="清空对话">
+        <svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main id="chat">
+    <div class="welcome" id="welcome">
+      <div class="logo">
+        <svg viewBox="0 0 24 24"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/><circle cx="12" cy="12" r="3.4"/></svg>
+      </div>
+      <h3>板子上的本地 AI</h3>
+      数据不出网关，纯 CPU 推理
+      <div class="chips">
+        <span class="chip">用一句话解释什么是 NPU</span>
+        <span class="chip">写个 shell 脚本统计日志里 404 的数量</span>
+        <span class="chip">OpenWrt 和一般 Linux 有什么区别？</span>
+      </div>
+    </div>
+  </main>
+
+  <div class="hint">本地推理 · 纯 CPU<span id="ver"> · v2.6</span></div>
+
+  <footer>
+    <div class="inputwrap">
+      <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+    </div>
+    <button id="send"><svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 8 6 8z"/></svg></button>
+    <button id="stop" hidden><svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg></button>
+  </footer>
+</div>
+
+<button id="scrollBtn" aria-label="回到底部">
+  <svg viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
+</button>
+<div id="toast"></div>
+
+<script>
+(function(){
+  "use strict";
+  /* 页面不含任何凭据：端口/模型名来自 /cgi-bin/llama，口令只存浏览器 localStorage */
+
+  var el = function(id){ return document.getElementById(id); };
+  var chat = el("chat"), input = el("input"), sendBtn = el("send"),
+      stopBtn = el("stop"), dot = el("dot"), modelEl = el("model"),
+      tpsEl = el("tps"), clearBtn = el("clear"), keyBtn = el("keybtn"),
+      scrollBtn = el("scrollBtn");
+
+  var CONF = { port: "", model: "", need_key: 0, enabled: 1 };
+  var API = "";   // filled from /cgi-bin/llama, never hardcoded
+  var KEY_STORE = "llama_key";
+  var SYSTEM = "你是一个运行在路由器上的本地 AI 助手。用中文回答。" +
+               "普通问答保持简洁；但用户要代码、脚本或详细步骤时，必须给出完整可运行的内容，" +
+               "不要用「...」「略」跳过大段代码。" +
+               "不会就直说不会，不要编造。" +
+               "用户和你不是同一个人：用户说的「我」指用户自己。";
+
+  var history = [], ctrl = null, busy = false, stickBottom = true;
+
+  function toast(msg, ms){
+    var t = el("toast");
+    t.textContent = msg;
+    t.classList.add("show");
+    clearTimeout(toast._t);
+    toast._t = setTimeout(function(){ t.classList.remove("show"); }, ms || 2200);
+  }
+
+  function esc(s){
+    return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  }
+
+  /* 流式渲染时每个 chunk 都会重跑一遍，只用最轻的几条；完整符号表留到收尾跑一次，
+     否则 45 条正则 × 累积全文 = O(n^2)，低性能设备上会明显卡顿。 */
+  function demathLight(s){
+    return String(s)
+      .replace(/\\\[|\\\]|\\\(|\\\)|\$\$/g, " ")
+      .replace(/\\sqrt\s*\{([^{}]*)\}/g, function(m, inner){
+        return /^[\w\u0370-\u03ff]$/.test(inner) ? "√" + inner : "√(" + inner + ")";
+      })
+      .replace(/\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, "($1)/($2)")
+      .replace(/\\[a-zA-Z]+/g, "")
+      .replace(/[{}]/g, "");
+  }
+
+  /* 模型爱吐 LaTeX 且不再在 prompt 里花钱纠正它，全部在这里转成可读文本。
+     不追求排版精度，只求"人能看懂、不留反斜杠"。 */
+  function demath(s){
+    return String(s)
+      /* 定界符 / 环境 */
+      .replace(/\\\[|\\\]|\\\(|\\\)|\$\$/g, " ")
+      .replace(/\\begin\{[^}]*\}|\\end\{[^}]*\}/g, " ")
+      /* 带参数的构造 */
+      /* 根号：单字符直接 √x；多项内容必须加括号，否则 √x+y 分不清根号范围 */
+      .replace(/\\sqrt\s*\[([^\]]*)\]\s*\{([^{}]*)\}/g, function(m, n, inner){
+        return /^[\w\u0370-\u03ff]$/.test(inner) ? n + "√" + inner : n + "√(" + inner + ")";
+      })
+      .replace(/\\sqrt\s*\{([^{}]*)\}/g, function(m, inner){
+        return /^[\w\u0370-\u03ff]$/.test(inner) ? "√" + inner : "√(" + inner + ")";
+      })
+      .replace(/\\sqrt\s*([0-9A-Za-z])/g, "√$1")
+      .replace(/\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, "($1)/($2)")
+      .replace(/\\[ntr]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, "($1)/($2)")
+      .replace(/\\(?:text|mathrm|mathbf|mathit|operatorname)\s*\{([^{}]*)\}/g, "$1")
+      /* 关系 / 运算 */
+      .replace(/\\approx/g, "≈").replace(/\\neq|\\ne\b/g, "≠")
+      .replace(/\\leq?/g, "≤").replace(/\\geq?/g, "≥")
+      .replace(/\\ll\b/g, "≪").replace(/\\gg\b/g, "≫")
+      .replace(/\\equiv/g, "≡").replace(/\\propto/g, "∝")
+      .replace(/\\pm/g, "±").replace(/\\mp/g, "∓")
+      .replace(/\\times/g, "×").replace(/\\div/g, "÷").replace(/\\cdot/g, "·")
+      .replace(/\\int/g, "∫").replace(/\\sum/g, "Σ").replace(/\\prod/g, "∏")
+      .replace(/\\partial/g, "∂").replace(/\\nabla/g, "∇").replace(/\\infty/g, "∞")
+      .replace(/\\notin/g, "∉").replace(/\\in\b/g, "∈")
+      .replace(/\\cup/g, "∪").replace(/\\cap/g, "∩").replace(/\\subset/g, "⊂")
+      .replace(/\\leftrightarrow|\\Leftrightarrow/g, "↔").replace(/\\leftarrow/g, "←")
+      .replace(/\\Rightarrow/g, "⇒").replace(/\\to\b|\\rightarrow/g, "→")
+      /* 希腊字母 */
+      .replace(/\\alpha/g, "α").replace(/\\beta/g, "β").replace(/\\gamma/g, "γ")
+      .replace(/\\delta/g, "δ").replace(/\\epsilon/g, "ε").replace(/\\zeta/g, "ζ")
+      .replace(/\\eta/g, "η").replace(/\\theta/g, "θ").replace(/\\kappa/g, "κ")
+      .replace(/\\lambda/g, "λ").replace(/\\mu/g, "μ").replace(/\\nu/g, "ν")
+      .replace(/\\xi/g, "ξ").replace(/\\pi\b/g, "π").replace(/\\rho/g, "ρ")
+      .replace(/\\sigma/g, "σ").replace(/\\tau/g, "τ").replace(/\\phi/g, "φ")
+      .replace(/\\chi/g, "χ").replace(/\\psi/g, "ψ").replace(/\\omega/g, "ω")
+      .replace(/\\Gamma/g, "Γ").replace(/\\Delta/g, "Δ").replace(/\\Theta/g, "Θ")
+      .replace(/\\Lambda/g, "Λ").replace(/\\Pi/g, "Π").replace(/\\Sigma/g, "Σ")
+      .replace(/\\Phi/g, "Φ").replace(/\\Psi/g, "Ψ").replace(/\\Omega/g, "Ω")
+      /* 排版命令残渣 */
+      .replace(/\\(?:left|right|big|Big|bigg|Bigg)\s*/g, "")
+      .replace(/\\[,;:!]/g, " ").replace(/\\q?quad/g, "  ")
+      .replace(/\\ldots|\\cdots|\\dots/g, "…")
+      .replace(/\^\{?2\}?/g, "²").replace(/\^\{?3\}?/g, "³").replace(/\^\{?n\}?/g, "ⁿ")
+      /* 兜底：剩余命令与花括号 */
+      .replace(/\\[a-zA-Z]+/g, "")
+      .replace(/[{}]/g, "");
+  }
+
+  function render(text, withCopy, light){
+    var out = esc(light ? demathLight(text) : demath(text));
+    var parts = out.split(/```/);
+    var html = "";
+    for (var i = 0; i < parts.length; i++){
+      if (i % 2 === 1){
+        var body = parts[i].replace(/^[a-zA-Z0-9_+-]*\n/, "");
+        html += "<pre><code>" + body.replace(/\n$/, "") + "</code>" +
+                (withCopy ? '<button class="copy">复制</button>' : "") + "</pre>";
+      } else {
+        html += parts[i]
+          .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+          .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+      }
+    }
+    return html;
+  }
+
+  function nearBottom(){ return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 90; }
+  chat.addEventListener("scroll", function(){
+    stickBottom = nearBottom();
+    scrollBtn.classList.toggle("show", !stickBottom);
+  });
+  scrollBtn.addEventListener("click", function(){ chat.scrollTop = chat.scrollHeight; });
+  function scrollDown(force){ if (force || stickBottom) chat.scrollTop = chat.scrollHeight; }
+
+  chat.addEventListener("click", function(e){
+    if (!e.target.classList || !e.target.classList.contains("copy")) return;
+    var code = e.target.parentNode.querySelector("code");
+    if (!code) return;
+    var txt = code.textContent;
+    var done = function(){ e.target.textContent = "已复制"; setTimeout(function(){ e.target.textContent = "复制"; }, 1200); };
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(done, function(){ legacyCopy(txt) && done(); });
+    } else if (legacyCopy(txt)) done();
+    else toast("复制失败，请手动选择");
+  });
+  function legacyCopy(txt){
+    try {
+      var ta = document.createElement("textarea");
+      ta.value = txt; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      var ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch(e){ return false; }
+  }
+
+  function addMsg(role, html){
+    var w = el("welcome");
+    if (w && w.parentNode) w.parentNode.removeChild(w);
+    var row = document.createElement("div");
+    row.className = "msg " + (role === "user" ? "user" : "bot");
+    var who = document.createElement("div");
+    who.className = "who";
+    who.textContent = role === "user" ? "我" : "AI";
+    var bubble = document.createElement("div");
+    bubble.className = "bubble";
+    if (html) bubble.innerHTML = html;
+    row.appendChild(who); row.appendChild(bubble);
+    chat.appendChild(row);
+    scrollDown(true);
+    return bubble;
+  }
+
+  function setState(cls, text){
+    dot.className = "dot " + cls;
+    if (text) modelEl.textContent = text;
+  }
+  function setTps(v){
+    if (!v){ tpsEl.style.display = "none"; return; }
+    tpsEl.style.display = "";
+    tpsEl.innerHTML = "<b>" + v + "</b>";
+  }
+
+  /* ---------- 口令（只存在浏览器） ---------- */
+  function storedKey(){ return localStorage.getItem(KEY_STORE) || ""; }
+  function authHeaders(extra){
+    var h = extra || {};
+    var k = storedKey();
+    if (k) h["Authorization"] = "Bearer " + k;
+    return h;
+  }
+  function askKey(msg){
+    var v = window.prompt(msg || "该服务设了访问口令，请输入（留空 = 清除）：", "");
+    if (v === null) return false;
+    if (v === "") localStorage.removeItem(KEY_STORE);
+    else localStorage.setItem(KEY_STORE, v);
+    return true;
+  }
+
+  /* ---------- 配置发现：端口/模型全部来自 UCI，页面不猜 ---------- */
+  function loadConf(){
+    return fetch("/cgi-bin/llama?_=" + Date.now(), {cache: "no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        if (!j || !j.ok){
+          setState("err", "配置缺失");
+          toast((j && j.error) ? j.error : "读不到 /etc/config/llama 的配置", 6000);
+          return false;
+        }
+        CONF = j;
+        API = location.protocol + "//" + location.hostname + ":" + CONF.port;
+        if (CONF.model) modelEl.textContent = CONF.model;
+        return true;
+      })
+      .catch(function(){
+        setState("err", "配置缺失");
+        toast("读不到 /cgi-bin/llama，检查 uhttpd 是否正常", 6000);
+        return false;
+      });
+  }
+
+  function probe(){
+    fetch(API + "/health", {cache: "no-store", headers: authHeaders()})
+      .then(function(r){
+        if (r.status === 401){
+          setState("err", "需要口令");
+          if (!probe._asked){
+            probe._asked = 1;
+            if (askKey("服务开启了访问口令，请输入：")) setTimeout(probe, 300);
+          }
+          return null;
+        }
+        return r.json();
+      })
+      .then(function(j){
+        if (!j) return;
+        if (j.status === "ok"){
+          setState("ok", CONF.model || "已就绪");
+        } else {
+          setState("load", "模型加载中…");
+          setTimeout(probe, 3000);
+        }
+      })
+      .catch(function(){
+        setState("err", "服务未启动");
+        if (!probe._warned){
+          probe._warned = 1;
+          toast("后端没响应：检查 llama-server 是否启用、端口是否对", 5000);
+        }
+        setTimeout(probe, 5000);
+      });
+  }
+
+  /* ---------- 发送 ---------- */
+  function autosize(){
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 140) + "px";
+  }
+  input.addEventListener("input", autosize);
+
+  function setBusy(b){
+    busy = b;
+    sendBtn.disabled = b;
+    sendBtn.hidden = b;
+    stopBtn.hidden = !b;
+    input.disabled = b;
+  }
+
+  function send(){
+    var text = input.value.trim();
+    if (!text || busy) return;
+    input.value = ""; autosize();
+    history.push({role:"user", content:text});
+    addMsg("user", render(text, false));
+
+    var bubble = addMsg("bot", '<span class="typing"><i></i><i></i><i></i></span>');
+
+    ctrl = new AbortController();
+    setBusy(true);
+    setTps("");
+
+    var t0 = 0, nChunks = 0, acc = "";
+    var body = {
+      messages: [{role:"system", content:SYSTEM}].concat(history.slice(-6)),
+      stream: true, max_tokens: 1024, temperature: 0.7, top_p: 0.9,
+      /* 0.5B 很容易把同一段代码复读十几遍，默认 repeat_penalty 是 1.0（不惩罚） */
+      repeat_penalty: 1.15, repeat_last_n: 256, frequency_penalty: 0.3
+    };
+
+    fetch(API + "/v1/chat/completions", {
+      method: "POST",
+      headers: authHeaders({"Content-Type": "application/json"}),
+      body: JSON.stringify(body),
+      signal: ctrl.signal
+    }).then(function(resp){
+      if (resp.status === 401) throw new Error("401");
+      if (!resp.ok || !resp.body) throw new Error("HTTP " + resp.status);
+      var reader = resp.body.getReader(), dec = new TextDecoder("utf-8"), buf = "";
+      function pump(){
+        return reader.read().then(function(r){
+          if (r.done) return;
+          buf += dec.decode(r.value, {stream:true});
+          var lines = buf.split("\n");
+          buf = lines.pop();
+          for (var i = 0; i < lines.length; i++){
+            var line = lines[i].trim();
+            if (line.indexOf("data:") !== 0) continue;
+            var payload = line.slice(5).trim();
+            if (payload === "[DONE]") continue;
+            var j;
+            try { j = JSON.parse(payload); } catch(e){ continue; }
+            var d = j.choices && j.choices[0] && j.choices[0].delta;
+            var piece = (d && d.content) || "";
+            if (piece){
+              if (!t0) t0 = performance.now();
+              acc += piece; nChunks++;
+              bubble.innerHTML = render(acc, false, true) + '<span class="caret"></span>';
+              scrollDown(false);
+              if (nChunks % 10 === 0 && t0){
+                var secs = (performance.now() - t0) / 1000;
+                if (secs > 0.5) setTps((nChunks / secs).toFixed(1) + " t/s");
+              }
+            }
+          }
+          return pump();
+        });
+      }
+      return pump();
+    }).then(function(){
+      finish(null);
+    }).catch(function(e){
+      if (e && e.name === "AbortError") { finish("__stop__"); return; }
+      finish(e && e.message ? e.message : "请求失败");
+    });
+
+    function finish(err){
+      setBusy(false);
+      history.push({role:"assistant", content:acc});
+      if (acc){
+        bubble.innerHTML = render(acc, true);
+      } else if (err === "401"){
+        bubble.innerHTML = '<span style="color:#f85149">需要访问口令，点右上角钥匙图标输入</span>';
+        askKey("服务开启了访问口令，请输入：");
+      } else {
+        bubble.innerHTML = '<span style="color:#f85149">' +
+          (err === "__stop__" ? "已停止" : ("出错：" + err)) + '</span>';
+      }
+      if (t0 && nChunks){
+        var s = (performance.now() - t0) / 1000;
+        if (s > 0.5) setTps((acc.length / s).toFixed(1) + " 字/s");
+      }
+      if (err && err !== "__stop__" && err !== "401"){
+        toast(err === "HTTP 503" ? "模型还在加载，稍等再发" : ("请求失败：" + err), 4000);
+      }
+      ctrl = null;
+      scrollDown(false);
+      if (!busy) input.focus();
+    }
+  }
+
+  sendBtn.addEventListener("click", send);
+  stopBtn.addEventListener("click", function(){ if (ctrl) ctrl.abort(); });
+  input.addEventListener("keydown", function(e){
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing){ e.preventDefault(); send(); }
+  });
+  keyBtn.addEventListener("click", function(){
+    if (askKey(storedKey() ? "修改访问口令（留空 = 清除）：" : "服务开通了口令就填这里（留空 = 不用）：")){
+      probe._asked = 0; probe._warned = 0;
+      probe();
+    }
+  });
+  clearBtn.addEventListener("click", function(){
+    if (busy && ctrl) ctrl.abort();
+    history = [];
+    chat.innerHTML = "";
+    setTps("");
+    var w = document.createElement("div");
+    w.className = "welcome"; w.id = "welcome";
+    w.innerHTML = '<h3>对话已清空</h3><span style="font-size:13px">接着问吧</span>';
+    chat.appendChild(w);
+    input.focus();
+  });
+
+  Array.prototype.forEach.call(document.querySelectorAll(".chip"), function(c){
+    c.addEventListener("click", function(){
+      input.value = c.textContent;
+      autosize();
+      input.focus();
+    });
+  });
+
+  autosize();
+  loadConf().then(function(ok){ if (ok) probe(); });
+  input.focus();
+})();
+</script>
+</body>
+</html>
