@@ -8,18 +8,19 @@
 <title>本地 AI 助手</title>
 <style>
   :root{
-    --bg:#0b0f14; --bg2:#0d1117; --panel:#151b23; --panel2:#1b222c;
-    --border:#232c38; --border2:#2d3846;
-    --text:#d7dde5; --dim:#8b96a5; --dim2:#5f6b7a;
-    --accent:#4a9eff; --accent2:#2f7fe0; --accent-soft:rgba(74,158,255,.14);
-    --ok:#3fb950; --warn:#d29922; --err:#f85149;
+    /* 整体提亮 + 提高对比：原来的 #0b0f14 太黑、#8b96a5 太灰，长时间看很累 */
+    --bg:#151a22; --bg2:#191f28; --panel:#20272f; --panel2:#28303b;
+    --border:#333c4a; --border2:#414c5e;
+    --text:#e9eef5; --dim:#a7b2c0; --dim2:#7c8794;
+    --accent:#5aa9ff; --accent2:#3d8ae8; --accent-soft:rgba(90,169,255,.16);
+    --ok:#4ecb62; --warn:#e0a92f; --err:#ff6b63;
     --radius:14px;
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   [hidden]{display:none!important}
   html,body{margin:0;height:100%;background:
-    radial-gradient(1200px 600px at 50% -20%, #14202e 0%, transparent 60%), var(--bg);
-    color:var(--text);font:15px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+    radial-gradient(1200px 600px at 50% -20%, #1c2939 0%, transparent 55%), var(--bg);
+    color:var(--text);font:16px/1.75 -apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
     -webkit-font-smoothing:antialiased}
   #app{display:flex;flex-direction:column;height:100dvh;max-width:900px;margin:0 auto}
 
@@ -28,7 +29,12 @@
     background:rgba(21,27,35,.86);backdrop-filter:blur(12px);
     position:sticky;top:0;z-index:5;flex-wrap:wrap}
   .brand{display:flex;align-items:center;gap:9px;font-weight:650;letter-spacing:.2px;font-size:15px}
-  .dot{width:9px;height:9px;border-radius:50%;background:var(--dim2);flex:0 0 auto;
+  /* 左上角忙闲状态（问 CGI ?status=1，判据与提交互斥一致） */
+.stat{font-size:11px;color:#7d8b9e;margin-left:6px;letter-spacing:.2px}
+.stat.busy{color:#fbbf24}
+.stat.idle{color:#4ade80}
+.stat.unknown{color:#6b7a8d}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--dim2);flex:0 0 auto;
     box-shadow:0 0 0 3px rgba(95,107,122,.16);transition:.3s}
   .dot.ok{background:var(--ok);box-shadow:0 0 0 3px rgba(63,185,80,.18)}
   .dot.load{background:var(--warn);box-shadow:0 0 0 3px rgba(210,153,34,.18);animation:pulse 1.3s infinite}
@@ -47,7 +53,9 @@
   .ibtn svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.9;
     stroke-linecap:round;stroke-linejoin:round}
 
-  main{flex:1;overflow-y:auto;padding:22px 18px 10px;scroll-behavior:smooth}
+  /* 不要用 scroll-behavior:smooth：agent 每 1.5s 轮询更新，
+     平滑滚动动画会被一次次打断，永远滚不到底（表现为"锁在顶部"） */
+  main{flex:1;overflow-y:auto;padding:22px 18px 10px}
   main::-webkit-scrollbar{width:8px}
   main::-webkit-scrollbar-thumb{background:#2a3542;border-radius:4px}
   main::-webkit-scrollbar-track{background:transparent}
@@ -55,8 +63,8 @@
   .msg{display:flex;margin-bottom:18px;gap:11px;align-items:flex-start;
     animation:rise .28s cubic-bezier(.2,.8,.3,1) both}
   @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-  .msg .who{flex:0 0 30px;height:30px;border-radius:10px;display:grid;place-items:center;
-    font-size:11.5px;font-weight:700;background:var(--panel2);border:1px solid var(--border);
+  .msg .who{flex:0 0 32px;height:32px;border-radius:10px;display:grid;place-items:center;
+    font-size:12.5px;font-weight:700;background:var(--panel2);border:1px solid var(--border);
     color:var(--dim)}
   .msg.user{flex-direction:row-reverse}
   .msg.user .who{background:linear-gradient(135deg,var(--accent),var(--accent2));
@@ -67,12 +75,49 @@
   .msg.user .bubble{background:linear-gradient(135deg,var(--accent),var(--accent2));
     border-color:transparent;color:#fff;border-bottom-right-radius:5px;
     box-shadow:0 2px 10px rgba(47,127,224,.22)}
-  .msg.bot .bubble{border-bottom-left-radius:5px}
+  /* 字号三档：标准 / 大 / 特大。用 body class 覆盖关键字号，
+     比全站 calc() 简单可靠；选择存 localStorage。 */
+  body.fs-lg{font-size:17.5px}
+  body.fs-lg .afinal{font-size:18px}
+  body.fs-lg .astep-r{font-size:15px}
+  body.fs-lg .astep-h{font-size:14.5px}
+  body.fs-lg .astep-h code,body.fs-lg .chip,body.fs-lg .secs{font-size:13.5px}
+  body.fs-lg .astat{font-size:13px}
+  body.fs-xl{font-size:19px}
+  body.fs-xl .afinal{font-size:19.5px}
+  body.fs-xl .astep-r{font-size:16.5px}
+  body.fs-xl .astep-h{font-size:15.5px}
+  body.fs-xl .astep-h code,body.fs-xl .chip,body.fs-xl .secs{font-size:14.5px}
+  body.fs-xl .astat{font-size:14px}
+  /* 深色滚动条：默认的白色滚动条在深色主题上非常扎眼 */
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:#2a3644;border-radius:4px}
+  ::-webkit-scrollbar-thumb:hover{background:#3c4c60}
+  .msg.user .bubble{max-height:180px;overflow-y:auto}
+  /* AI 气泡给个下限：纯 fit-content 时短内容会缩成一条，代码块/表格就挤扁了 */
+  .msg.bot .bubble{border-bottom-left-radius:5px;min-width:min(380px,86%)}
   .bubble code{background:#0a0e13;border:1px solid var(--border);border-radius:5px;
     padding:1.5px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.88em}
   .bubble pre{position:relative;background:#0a0e13;border:1px solid var(--border);border-radius:10px;
     padding:12px 14px;overflow-x:auto;margin:9px 0}
   .bubble pre code{background:none;border:0;padding:0;font-size:.87em;line-height:1.55}
+  /* markdown 元素样式（表格/列表/标题/引用），之前只有裸文本 */
+  .bubble table{border-collapse:collapse;margin:10px 0;font-size:14px}
+  .bubble th,.bubble td{border:1px solid var(--border);padding:5px 10px;text-align:left}
+  .bubble th{background:rgba(255,255,255,.055);font-weight:650;color:var(--text)}
+  .bubble tbody tr:nth-child(even){background:rgba(255,255,255,.018)}
+  .bubble ul,.bubble ol{margin:8px 0;padding-left:23px}
+  .bubble li{margin:3.5px 0}
+  .bubble h3,.bubble h4,.bubble h5,.bubble h6{margin:11px 0 6px;
+    font-size:15px;font-weight:650;color:var(--text);line-height:1.4}
+  .bubble blockquote{margin:9px 0;padding:7px 13px;border-left:3px solid var(--border2);
+    color:var(--dim);background:rgba(255,255,255,.022);border-radius:0 7px 7px 0}
+  .bubble i{color:#c8d4e0}
+  /* 代码高亮配色（One Dark 系） */
+  .c-kw{color:#ff7ab2}                    /* 关键字 */
+  .c-st{color:#a8e07a}                    /* 字符串 */
+  .c-cm{color:#5d6b7a;font-style:italic}  /* 注释 */
   .bubble pre .copy{position:absolute;top:6px;right:6px;font-size:11px;padding:3px 8px;
     border-radius:6px;background:#1b222c;border:1px solid var(--border2);color:var(--dim);
     cursor:pointer;opacity:0;transition:.15s}
@@ -110,10 +155,12 @@
     border-top:1px solid var(--border);background:rgba(21,27,35,.92);
     backdrop-filter:blur(12px);position:sticky;bottom:0;
     padding-bottom:calc(14px + env(safe-area-inset-bottom))}
-  .inputwrap{flex:1;position:relative;display:flex}
+  .inputwrap{flex:1;position:relative;display:flex;align-items:flex-end;gap:8px}
+  .inputwrap > #upbtn{flex:none;width:38px;height:38px;margin-bottom:3px}
   #input{flex:1;resize:none;max-height:140px;min-height:44px;padding:11px 14px;
     border-radius:13px;border:1px solid var(--border);background:var(--panel2);
-    color:var(--text);font:inherit;outline:none;transition:.18s;line-height:1.5}
+    color:var(--text);font:inherit;outline:none;transition:.18s;line-height:1.5;
+    overflow-y:auto}
   #input::placeholder{color:var(--dim2)}
   #input:focus{border-color:rgba(74,158,255,.55);background:#0f151c;
     box-shadow:0 0 0 3px rgba(74,158,255,.1)}
@@ -137,6 +184,65 @@
   #scrollBtn svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2;
     stroke-linecap:round;stroke-linejoin:round}
 
+  .modebtn{
+    padding:6px 12px;border-radius:8px;border:1px solid var(--border2);
+    background:var(--panel2);color:var(--dim);font-size:12px;font-weight:600;
+    cursor:pointer;transition:.16s;margin-right:2px;
+  }
+  .modebtn:hover{background:#222c38;color:var(--text)}
+  /* Agent 用青绿系，跟对话模式的蓝色区分开，一眼能看出当前在执行什么 */
+  .modebtn.on{background:linear-gradient(135deg,#34d399,#0ea371);
+    border-color:transparent;color:#052e1f;box-shadow:0 2px 10px rgba(52,211,153,.32)}
+  /* Agent 气泡：内容多，给足宽度（普通气泡是 fit-content，会缩成一条） */
+  .bubble.agent-bubble{width:min(88%,760px);max-width:min(88%,760px)}
+  .bubble.agent-bubble .agent-wrap{width:100%}
+  .agent-wrap{display:flex;flex-direction:column;gap:7px}
+  .astep{background:linear-gradient(180deg,rgba(52,211,153,.06),rgba(52,211,153,.025));
+    border:1px solid rgba(52,211,153,.24);border-radius:11px;padding:12px 15px}
+  .astep-h{display:flex;align-items:center;gap:9px;font-size:13.5px}
+  .astep-h b{width:19px;height:19px;border-radius:50%;
+    background:linear-gradient(135deg,#34d399,#0ea371);color:#052e1f;
+    display:inline-flex;align-items:center;justify-content:center;font-size:11px;
+    flex:none;font-weight:800}
+  .chip{background:rgba(52,211,153,.18);color:#6ee7b8;padding:2px 9px;
+    border-radius:6px;font-size:12.5px;font-weight:650;
+    font-family:ui-monospace,Menlo,monospace;
+    border:1px solid rgba(52,211,153,.24)}
+  .astep-h code{color:#a8e0cd;font-size:12.5px;background:#0d1a17;padding:2px 8px;
+    border-radius:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    max-width:52%;font-family:ui-monospace,Menlo,monospace;
+    border:1px solid rgba(52,211,153,.16)}
+  .secs{margin-left:auto;color:#93a0ae;font-size:12.5px;flex:none;
+    font-variant-numeric:tabular-nums}
+  .astep-r{color:#b3c0cd;font-size:13.5px;line-height:1.72;margin-top:9px;
+    white-space:pre-wrap;word-break:break-word;max-height:160px;overflow:auto;
+    padding-left:9px;border-left:2px solid rgba(52,211,153,.28)}
+  /* 推理/正文类内容完整展开，不折叠（数学推导被裁一半等于没有） */
+  .astep-r.full{max-height:none;overflow:visible}
+  .afinal{font-size:16.5px;line-height:1.85;color:var(--text);margin-top:7px;white-space:pre-wrap}
+  /* 最终回答里的表格：分列对齐显示（"名称 | 数值"拼一行看不出来） */
+  .afinal table{border-collapse:collapse;margin:8px 0;font-size:14.5px;
+    white-space:normal;width:100%;table-layout:fixed}
+  .afinal th,.afinal td{border:1px solid var(--border);padding:6px 10px;
+    text-align:left;vertical-align:top;word-break:break-word}
+  .afinal th{background:var(--panel2);font-weight:600;color:var(--dim)}
+  .afinal td:first-child{width:72%}
+  .afinal td:last-child,.afinal th:last-child{text-align:right;
+    font-variant-numeric:tabular-nums;white-space:nowrap}
+  .astat{color:#8794a1;font-size:12px;text-align:right;
+    font-variant-numeric:tabular-nums}
+  .awarn{color:#efb44d;font-size:13px;background:rgba(239,180,77,.1);
+    border-left:2px solid #efb44d;padding:7px 11px;border-radius:0 7px 7px 0}
+  .dl{display:block;margin:8px 0 0 auto;font-size:11px;padding:3px 11px;
+    border-radius:6px;background:rgba(52,211,153,.12);color:#5fe3b0;
+    border:1px solid rgba(52,211,153,.26);cursor:pointer;font-family:inherit}
+  .dl:hover{background:rgba(52,211,153,.2);color:#8ff0c8}
+  .fdl{color:#5fe3b0;text-decoration:none;
+    border-bottom:1px dashed rgba(52,211,153,.5);cursor:pointer}
+  .fdl:hover{color:#8ff0c8;border-bottom-color:#8ff0c8}
+  audio.ap{display:block;width:100%;max-width:400px;margin:8px 0 3px;
+    height:34px;border-radius:8px}
+  .err{color:var(--err)}
   #toast{position:fixed;left:50%;bottom:96px;transform:translateX(-50%) translateY(16px);
     background:#222c38;border:1px solid var(--border2);color:var(--text);padding:10px 17px;
     border-radius:11px;font-size:13px;opacity:0;pointer-events:none;transition:.24s;z-index:20;
@@ -152,18 +258,83 @@
     .tag{max-width:120px}
     .welcome{padding:32px 8px 18px}
   }
+/* 环境与插件面板（顶部按钮点开） */
+.envpanel{position:fixed;top:52px;right:14px;z-index:60;display:none;
+  min-width:270px;max-width:350px;max-height:70vh;overflow-y:auto;
+  padding:11px 13px;border-radius:11px;background:#151c26;
+  border:1px solid #24303f;box-shadow:0 14px 36px rgba(0,0,0,.6);
+  font-size:12px;color:#c8d3e0}
+.envpanel.show{display:block}
+.envpanel h4{margin:0 0 7px;font-size:10.5px;color:#7d8b9e;font-weight:600;letter-spacing:.5px}
+.envpanel .row{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:11px}
+.envpanel .plist{display:flex;flex-direction:column;gap:5px}
+.envpanel .pitem{padding:6px 9px;border-radius:7px;background:#101822;border:1px solid #1f2a38}
+.envpanel .pitem b{color:#8ee6c8;font-size:11.5px;font-weight:600}
+.envpanel .pitem span{display:block;color:#6b7a8d;font-size:10.5px;margin-top:2px;line-height:1.35}
+/* 自动化插件：和被动工具区分开 */
+.envpanel .pitem.auto{border-color:#2d5f52;background:#0e1d19}
+.envpanel .pitem span.pill{display:inline-block;margin-left:6px;padding:0 5px;border-radius:4px;
+  font-size:9.5px;background:#243044;color:#8fb3ff;vertical-align:1px;font-weight:400}
+.envpanel .pitem.auto span.pill{background:#164034;color:#6ee7b7}
+.envpanel .trg{font-size:10px;color:#7b8ba0;margin-top:2px;font-family:monospace}
+.envpanel .autoact{margin-top:6px;padding:2px 12px;border-radius:6px;cursor:pointer;
+  font-size:11px;background:#1c3a30;color:#6ee7b7;border:1px solid #2d5f52}
+.envpanel .autoact:hover{background:#245043}
+.envpanel .autoact.bg{background:#182434;color:#8fb3ff;border-color:#2d415f;margin-left:6px}
+.envpanel .autoact.bg:hover{background:#1f3049}
+.envpanel .autoact.stop{background:#3a1d1d;color:#ff8f88;border-color:#5f2d2d}
+.envpanel .autoact.stop:hover{background:#4a2424}
+.envpanel .astate{margin-top:5px;font-size:11px}
+.envpanel .astate.off{color:#6b7a8d}
+.envpanel .astate.on{color:#4ade80}
+/* 两类能力配色：底层运行时=蓝，专用库=紫，缺失=灰 */
+.envpanel .chip.rt{color:#9ecbff;border-color:#27476b;background:#0f1b2a}
+.envpanel .chip.rt i{background:#4d9bff;box-shadow:0 0 6px #4d9bff}
+.envpanel .chip.lib{color:#c9b8ff;border-color:#453a6b;background:#171327}
+.envpanel .chip.lib i{background:#a78bfa;box-shadow:0 0 6px #a78bfa}
+.envpanel .chip.off{color:#5d6a7d;border-color:#2b3648;background:#0f141c}
+.envpanel .chip.off i{background:#3a4557;box-shadow:none}
+/* 环境 + LaTeX 公式（客户端渲染，不依赖外部库/CDN） */
+.tex{font-family:"Latin Modern Math","Cambria Math","Times New Roman",serif;
+  font-style:italic;white-space:nowrap}
+.tex .frc{display:inline-flex;flex-direction:column;vertical-align:middle;
+  text-align:center;font-size:.85em;line-height:1.08;margin:0 .15em}
+.tex .frc .num{border-bottom:1px solid currentColor;padding:0 4px}
+.tex .frc .den{padding:0 4px}
+.tex .sqrt{white-space:nowrap}
+.tex .sqrt .rad{border-top:1px solid currentColor;padding:0 3px;margin-left:-1px}
+.texblk{text-align:center;margin:12px 0;font-size:16px;
+  font-family:"Latin Modern Math","Cambria Math","Times New Roman",serif;font-style:italic}
+.tex sup,.tex sub,.texblk sup,.texblk sub{font-size:.72em;font-style:normal}
+/* 插件结果的附加信息（方程、解、天数这些小字） */
+.pmeta{margin-top:5px;font-size:11.5px;color:var(--dim2);
+  border-left:2px solid var(--border2);padding-left:7px}
+.pmeta .err{color:var(--err)}
+/* 步骤卡片里的表格（table 插件返回 markdown 表格，渲染出来要有网格） */
+.astep-r table{border-collapse:collapse;margin:8px 0;font-size:13px;
+  width:100%;table-layout:fixed}
+.astep-r th,.astep-r td{border:1px solid var(--border);padding:4px 8px;
+  text-align:left;white-space:normal;word-break:break-all}
+.astep-r th{background:var(--panel2);font-weight:600;color:var(--text)}
+.astep-r .texblk{font-size:15px}
 </style>
 </head>
 <body>
 <div id="app">
   <header>
-    <div class="brand"><span class="dot" id="dot"></span>本地 AI 助手</div>
+    <div class="brand"><span class="dot" id="dot"></span>本地 AI 助手<span class="stat" id="stat"></span></div>
     <div class="meta">
       <span class="tag" id="model">连接中…</span>
       <span class="tag" id="tps" style="display:none"></span>
       <button class="ibtn" id="keybtn" title="访问口令" aria-label="访问口令">
         <svg viewBox="0 0 24 24"><path d="M15 7a4 4 0 1 0-4 4M12 11l-8 8v3h3l1-1v-2h2v-2h2l1-1"/></svg>
       </button>
+      <button class="ibtn" id="envbtn" title="环境与插件" aria-label="环境与插件">
+        <svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h10M18 18h2"/><circle cx="16" cy="6" r="1.8"/><circle cx="10" cy="12" r="1.8"/><circle cx="16" cy="18" r="1.8"/></svg>
+      </button>
+      <button class="modebtn" id="modebtn" title="切换 对话 / Agent 模式">对话</button>
+      <button class="ibtn" id="fsbtn" title="字号（点按循环：标准→大→特大）" aria-label="字号"
+        style="font-size:13px;font-weight:700">A</button>
       <button class="ibtn" id="clear" title="清空对话" aria-label="清空对话">
         <svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>
       </button>
@@ -185,10 +356,24 @@
     </div>
   </main>
 
-  <div class="hint">本地推理 · 纯 CPU<span id="ver"> · v2.6</span></div>
+  <div class="hint">本地推理 · 纯 CPU<span id="ver"> · v6.0</span></div>
+
+  <div class="envpanel" id="envpanel">
+    <h4>底层运行时</h4>
+    <div class="row" id="envrts"></div>
+    <h4>专用库（特定插件才用）</h4>
+    <div class="row" id="envlibs"></div>
+    <h4>插件（点击顶部按钮刷新）</h4>
+    <div class="plist" id="envplugs"></div>
+  </div>
 
   <footer>
     <div class="inputwrap">
+      <button class="ibtn" id="upbtn" title="上传文件：纯文本（txt/md/csv/json/log/yaml/xml/代码）内置支持；PDF/Word/Excel/PPT 需要 doc 插件" aria-label="上传文件">
+        <svg viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+      </button>
+      <input type="file" id="fileinput" hidden
+             accept=".pdf,.docx,.doc,.xlsx,.xlsm,.pptx,.txt,.md,.csv,.json,.log">
       <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
     </div>
     <button id="send"><svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 8 6 8z"/></svg></button>
@@ -223,6 +408,23 @@
 
   var history = [], ctrl = null, busy = false, stickBottom = true;
 
+  /* 字号三档：标准 → 大 → 特大，选择存 localStorage（换页也记得） */
+  var FS_ORDER = ["md", "lg", "xl"];
+  var fsState = localStorage.getItem("llama-fs") || "md";
+  function applyFS(){
+    document.body.classList.remove("fs-lg", "fs-xl");
+    if (fsState === "lg") document.body.classList.add("fs-lg");
+    if (fsState === "xl") document.body.classList.add("fs-xl");
+    var fb = document.getElementById("fsbtn");
+    if (fb) fb.textContent = fsState === "md" ? "A" : (fsState === "lg" ? "A+" : "A++");
+  }
+  applyFS();
+  document.getElementById("fsbtn").addEventListener("click", function(){
+    fsState = FS_ORDER[(FS_ORDER.indexOf(fsState) + 1) % FS_ORDER.length];
+    localStorage.setItem("llama-fs", fsState);
+    applyFS();
+  });
+
   function toast(msg, ms){
     var t = el("toast");
     t.textContent = msg;
@@ -237,6 +439,16 @@
 
   /* 流式渲染时每个 chunk 都会重跑一遍，只用最轻的几条；完整符号表留到收尾跑一次，
      否则 45 条正则 × 累积全文 = O(n^2)，低性能设备上会明显卡顿。 */
+  /* 下标数字 → Unicode 下标（化学式 H_2O、数学 x_{12} 都用）
+     只处理 _ 后跟数字，避免误伤 my_var 这种标识符。 */
+  var SUBMAP = "₀₁₂₃₄₅₆₇₈₉";
+  function toSub(digits){
+    return String(digits).split("").map(function(c){
+      var n = +c;
+      return isNaN(n) ? c : SUBMAP.charAt(n);
+    }).join("");
+  }
+
   function demathLight(s){
     return String(s)
       .replace(/\\\[|\\\]|\\\(|\\\)|\$\$/g, " ")
@@ -245,7 +457,9 @@
       })
       .replace(/\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, "($1)/($2)")
       .replace(/\\[a-zA-Z]+/g, "")
-      .replace(/[{}]/g, "");
+      .replace(/[{}]/g, "")
+      .replace(/\^\{?-\}?/g, "⁻").replace(/\^\{?\+\}?/g, "⁺")
+      .replace(/_\{?(\d+)\}?/g, function(m, d){ return toSub(d); });
   }
 
   /* 模型爱吐 LaTeX 且不再在 prompt 里花钱纠正它，全部在这里转成可读文本。
@@ -296,31 +510,225 @@
       .replace(/\\[,;:!]/g, " ").replace(/\\q?quad/g, "  ")
       .replace(/\\ldots|\\cdots|\\dots/g, "…")
       .replace(/\^\{?2\}?/g, "²").replace(/\^\{?3\}?/g, "³").replace(/\^\{?n\}?/g, "ⁿ")
+      /* 离子/电荷：e^- → e⁻、H^+ → H⁺（化学方程式必用） */
+      .replace(/\^\{?-\}?/g, "⁻").replace(/\^\{?\+\}?/g, "⁺")
+      .replace(/\^\{?(\d)\}?/g, function(m, d){ return "⁰¹²³⁴⁵⁶⁷⁸⁹".charAt(+d); })
+      /* 下标：H_2O → H₂O、x_{12} → x₁₂（化学式和数学都常见） */
+      .replace(/_\{?(\d+)\}?/g, function(m, d){ return toSub(d); })
       /* 兜底：剩余命令与花括号 */
       .replace(/\\[a-zA-Z]+/g, "")
       .replace(/[{}]/g, "");
   }
 
+  /* 轻量 markdown（够用就好）：表格 / 有序无序列表 / 标题 / 引用 / 粗斜体 / 行内代码 */
+  function mdInline(t){
+    var lines = String(t || "").split("\n");
+    var out = [], i = 0;
+    function inline(s){
+      return s.replace(/`([^`\n]+)`/g, "<code>$1</code>")
+              .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>")
+              .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<i>$2</i>");
+    }
+    while (i < lines.length){
+      var L = lines[i];
+      /* 表格：首行 | a | b |，次行 |---|---| */
+      if (/^\s*\|.*\|\s*$/.test(L) && i + 1 < lines.length
+          && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])){
+        var head = L.split("|").slice(1, -1).map(function(c){ return inline(c.trim()); });
+        i += 2;
+        var rows = [];
+        while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])){
+          rows.push(lines[i].split("|").slice(1, -1).map(function(c){ return inline(c.trim()); }));
+          i++;
+        }
+        var h = "<table><thead><tr>";
+        head.forEach(function(c){ h += "<th>" + c + "</th>"; });
+        h += "</tr></thead><tbody>";
+        rows.forEach(function(r){
+          h += "<tr>";
+          r.forEach(function(c){ h += "<td>" + c + "</td>"; });
+          h += "</tr>";
+        });
+        out.push(h + "</tbody></table>");
+        continue;
+      }
+      /* 无序列表 */
+      if (/^\s*[-*+]\s+/.test(L)){
+        var li1 = [];
+        while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])){
+          li1.push("<li>" + inline(lines[i].replace(/^\s*[-*+]\s+/, "")) + "</li>");
+          i++;
+        }
+        out.push("<ul>" + li1.join("") + "</ul>");
+        continue;
+      }
+      /* 有序列表 */
+      if (/^\s*\d+[.)]\s+/.test(L)){
+        var li2 = [];
+        while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])){
+          li2.push("<li>" + inline(lines[i].replace(/^\s*\d+[.)]\s+/, "")) + "</li>");
+          i++;
+        }
+        out.push("<ol>" + li2.join("") + "</ol>");
+        continue;
+      }
+      /* 标题 */
+      var hd = L.match(/^(#{1,4})\s+(.*)$/);
+      if (hd){
+        var lv = Math.min(hd[1].length + 2, 6);
+        out.push("<h" + lv + ">" + inline(hd[2]) + "</h" + lv + ">");
+        i++;
+        continue;
+      }
+      /* 引用（注意 esc() 已经把 > 转成了 &gt;） */
+      if (/^\s*(&gt;|>)\s?/.test(L)){
+        var qs = [];
+        while (i < lines.length && /^\s*(&gt;|>)\s?/.test(lines[i])){
+          qs.push(lines[i].replace(/^\s*(&gt;|>)\s?/, ""));
+          i++;
+        }
+        out.push("<blockquote>" + inline(qs.join("<br>")) + "</blockquote>");
+        continue;
+      }
+      out.push(inline(L));
+      i++;
+    }
+    return out.join("\n");
+  }
+
+  /* 极简语法高亮（不引第三方库）。
+     做法：先把字符串和注释摘成占位符，再给关键字染色，最后放回来 ——
+     否则注释里的 import/def 也会被当关键字涂色，或者 span 标签自身被二次匹配。 */
+  function hlCode(s){
+    var store = [];
+    function keep(cls, txt){
+      store.push('<span class="' + cls + '">' + txt + '</span>');
+      return "\u0000" + (store.length - 1) + "\u0000";
+    }
+    var t = s
+      .replace(/(#[^\n]*)/g, function(m){ return keep("c-cm", m); })
+      .replace(/(\/\/[^\n]*)/g, function(m){ return keep("c-cm", m); })
+      /* 三引号 docstring 要排在普通字符串前面。
+         坑：esc() 只转 & < >，双引号可能原样保留，也可能在别处成了 &quot; 实体，
+         所以正则里两种形式都得认。 */
+      .replace(/((?:"|&quot;){3}[\s\S]*?(?:"|&quot;){3}|(?:'|&#39;){3}[\s\S]*?(?:'|&#39;){3})/g,
+               function(m){ return keep("c-st", m); })
+      .replace(/((?:"|&quot;)[^\n]*?(?:"|&quot;)|'[^'\n]*')/g,
+               function(m){ return keep("c-st", m); });
+    t = t.replace(/\b(import|from|as|def|class|return|if|elif|else|for|while|try|except|finally|with|lambda|yield|raise|pass|break|continue|and|or|not|in|is|None|True|False|const|let|var|function|new|this|async|await|require|module|exports|package|public|private|static|void|int|float|double|bool|String|print)\b/g,
+                  '<span class="c-kw">$1</span>');
+    return t.replace(/\u0000(\d+)\u0000/g, function(_, i){ return store[+i]; });
+  }
+
+  /* ---------- LaTeX 公式（轻量渲染，纯客户端） ----------
+     支持 $行内$ / $$块级$$、\frac、\sqrt、^{}、_{} 和常见符号。
+     做法：先把 $...$ 抽成占位符再交给 markdown，最后还原 ——
+     否则公式里的 * _ ^ 会被 markdown 当强调/下标改坏。 */
+  var TEX_MAP = {
+    alpha:'α', beta:'β', gamma:'γ', delta:'δ', epsilon:'ε', varepsilon:'ε',
+    zeta:'ζ', eta:'η', theta:'θ', iota:'ι', kappa:'κ', lambda:'λ', mu:'μ',
+    nu:'ν', xi:'ξ', pi:'π', rho:'ρ', sigma:'σ', tau:'τ', upsilon:'υ', phi:'φ',
+    varphi:'φ', chi:'χ', psi:'ψ', omega:'ω',
+    Gamma:'Γ', Delta:'Δ', Theta:'Θ', Lambda:'Λ', Pi:'Π', Sigma:'Σ',
+    Phi:'Φ', Omega:'Ω', Psi:'Ψ',
+    times:'×', div:'÷', pm:'±', mp:'∓', le:'≤', leq:'≤', ge:'≥', geq:'≥',
+    ne:'≠', neq:'≠', approx:'≈', equiv:'≡', sim:'∼', propto:'∝',
+    infty:'∞', cdot:'·', ldots:'…', dots:'…', cdots:'⋯',
+    to:'→', rightarrow:'→', leftarrow:'←', Rightarrow:'⇒', Leftarrow:'⇐',
+    leftrightarrow:'↔',
+    sum:'∑', prod:'∏', int:'∫', iint:'∬', partial:'∂', nabla:'∇',
+    angle:'∠', triangle:'△', perp:'⊥', parallel:'∥', because:'∵',
+    therefore:'∴', degree:'°', prime:'′', circ:'∘',
+    in:'∈', notin:'∉', subset:'⊂', supset:'⊃', cup:'∪', cap:'∩',
+    empty:'∅', forall:'∀', exists:'∃', neg:'¬', land:'∧', lor:'∨'
+  };
+
+  function texBody(tex){
+    var s = esc(tex);
+    /* 分数（允许嵌套几层） */
+    for (var i = 0; i < 3; i++) {
+      s = s.replace(/\\[dt]?frac\{([^{}]*)\}\{([^{}]*)\}/g,
+        '<span class="frc"><span class="num">$1</span><span class="den">$2</span></span>');
+    }
+    /* 根号 */
+    s = s.replace(/\\sqrt\[([^\]]*)\]\{([^{}]*)\}/g,
+      '<span class="sqrt"><sup>$1</sup>√<span class="rad">$2</span></span>');
+    s = s.replace(/\\sqrt\{([^{}]*)\}/g, '<span class="sqrt">√<span class="rad">$1</span></span>');
+    s = s.replace(/\\sqrt/g, '√');
+    /* 上下标 */
+    s = s.replace(/\^\{([^{}]*)\}/g, '<sup>$1</sup>').replace(/\^([\w.])/g, '<sup>$1</sup>');
+    s = s.replace(/_\{([^{}]*)\}/g, '<sub>$1</sub>').replace(/_([\w.])/g, '<sub>$1</sub>');
+    /* 命令 → 符号；认不出的命令直接去掉反斜杠 */
+    s = s.replace(/\\([a-zA-Z]+)/g, function(m, n){ return TEX_MAP[n] || n; });
+    /* 排版指令扔掉 */
+    s = s.replace(/\\(left|right|displaystyle|limits|quad|qquad|,|;|!| )/g, ' ');
+    s = s.replace(/\\\\/g, ' ');
+    s = s.replace(/[{}]/g, '');
+    return s;
+  }
+
+  function protectMath(s){
+    var store = [];
+    /* 行内代码里的 $ 不是公式（比如 `awk '{print $1}'`），先保护起来 */
+    s = s.replace(/`([^`\n]+)`/g, function(m, c){
+      store.push('<code>' + esc(c) + '</code>');
+      return "@@TEX" + (store.length - 1) + "@@";
+    });
+    s = s.replace(/\$\$([\s\S]+?)\$\$/g, function(m, t){
+      store.push('<div class="texblk">' + texBody(t) + '</div>');
+      /* 前后留空行：不然紧跟着的 markdown 表格会被粘到同一行，渲染不出来 */
+      return "\n\n@@TEX" + (store.length - 1) + "@@\n\n";
+    });
+    s = s.replace(/\$([^$\n]{2,200}?)\$/g, function(m, t){
+      store.push('<span class="tex">' + texBody(t) + '</span>');
+      return "@@TEX" + (store.length - 1) + "@@";
+    });
+    return { text: s, store: store };
+  }
+
+  function restoreMath(html, store){
+    /* 块级公式被 markdown 包成 <p>@@TEX0@@</p>，整段换掉（div 不能嵌在 p 里） */
+    html = html.replace(/<p>\s*@@TEX(\d+)@@\s*<\/p>/g, function(_, i){ return store[+i] || ''; });
+    return html.replace(/@@TEX(\d+)@@/g, function(_, i){ return store[+i] || ''; });
+  }
+
   function render(text, withCopy, light){
-    var out = esc(light ? demathLight(text) : demath(text));
-    var parts = out.split(/```/);
+    /* 先按 ``` 分块，再分别处理：
+       代码块只做 HTML 转义 + 高亮，绝不跑 demath（那是给人话看的数学符号转换，
+       会把代码里的 """、\\ 之类改坏）；普通文本才 demath + markdown。 */
+    var parts = String(text || "").split(/```/);
     var html = "";
     for (var i = 0; i < parts.length; i++){
       if (i % 2 === 1){
-        var body = parts[i].replace(/^[a-zA-Z0-9_+-]*\n/, "");
-        html += "<pre><code>" + body.replace(/\n$/, "") + "</code>" +
+        var body = parts[i].replace(/^[a-zA-Z0-9_+-]*\n/, "").replace(/\n$/, "");
+        html += "<pre><code>" + hlCode(esc(body)) + "</code>" +
                 (withCopy ? '<button class="copy">复制</button>' : "") + "</pre>";
       } else {
-        html += parts[i]
-          .replace(/`([^`\n]+)`/g, "<code>$1</code>")
-          .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+        /* 顺序很关键：先把 $...$ 抽成占位符，再跑 demath。
+         * demath 会把 \frac{1}{2} 改写成 (1)/(2)，跑在它前面就毁了公式。 */
+        var pm = protectMath(parts[i]);
+        var plain = light ? demathLight(pm.text) : demath(pm.text);
+        html += restoreMath(mdInline(esc(plain)), pm.store);
       }
     }
     return html;
   }
+  window.render = render;          /* 方便控制台调试 */
 
   function nearBottom(){ return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 90; }
+  /* 程序滚动 vs 用户滚动要分开：
+     内容频繁增长时 scroll 事件也会触发，如果不屏蔽，
+     nearBottom() 会把"内容变高了"误判成"用户往上滚了"，
+     stickBottom 被置 false，之后就再也不跟随了。 */
+  var progScroll = false;
+  function scrollDown(force){
+    if (!force && !stickBottom) return;
+    progScroll = true;
+    chat.scrollTop = chat.scrollHeight;
+    requestAnimationFrame(function(){ progScroll = false; });
+  }
   chat.addEventListener("scroll", function(){
+    if (progScroll) return;              // 自己滚的，不算用户意图
     stickBottom = nearBottom();
     scrollBtn.classList.toggle("show", !stickBottom);
   });
@@ -362,6 +770,11 @@
     if (html) bubble.innerHTML = html;
     row.appendChild(who); row.appendChild(bubble);
     chat.appendChild(row);
+    // 长消息（超过 max-height）默认滚到末尾：用户要看的是刚发的最后一段，
+    // 停在开头会让人以为"卡住了 / 只有这么点"。
+    if (role === "user" && bubble.scrollHeight > bubble.clientHeight) {
+      bubble.scrollTop = bubble.scrollHeight;
+    }
     scrollDown(true);
     return bubble;
   }
@@ -461,9 +874,372 @@
     input.disabled = b;
   }
 
+  /* ---------- 对话 / Agent 双模式 ---------- */
+  var MODE = "agent";        /* 默认就是 Agent 模式（按钮点亮） */
+
+  (function initMode(){
+    var btn = document.getElementById("modebtn");
+    if (!btn) return;
+    /* 先按当前 MODE 把按钮和输入框提示渲染好，避免初始状态与按钮文字对不上 */
+    btn.textContent = (MODE === "agent") ? "Agent" : "对话";
+    btn.classList.toggle("on", MODE === "agent");
+    input.placeholder = (MODE === "agent")
+      ? "给 Agent 一个任务，例如：看看 /tmp 下最大的文件"
+      : "说点什么…（Enter 发送，Shift+Enter 换行）";
+    btn.addEventListener("click", function(){
+      MODE = (MODE === "chat") ? "agent" : "chat";
+      btn.textContent = (MODE === "agent") ? "Agent" : "对话";
+      btn.classList.toggle("on", MODE === "agent");
+      input.placeholder = (MODE === "agent")
+        ? "给 Agent 一个任务，例如：看看 /tmp 下最大的文件"
+        : "说点什么…（Enter 发送，Shift+Enter 换行）";
+      toast(MODE === "agent"
+        ? "Agent 模式：能调用工具、多步执行（慢，一步 1-2 分钟）"
+        : "已切回对话模式");
+    });
+  })();
+
+  /* 输出里出现的文件名变成可下载链接；音频类直接给个播放器 */
+  var FILE_RE = /([A-Za-z0-9_\u4e00-\u9fa5.\-]+\.(?:mid|midi|wav|mp3|ogg|pptx|py|md|txt|csv))/g;
+  function linkFiles(html){
+    return html.replace(FILE_RE, function(m){
+      var href = "/cgi-bin/agent?file=" + encodeURIComponent(m);
+      var link = '<a class="fdl" href="' + href + '" download>' + m + '</a>';
+      if (/\.(wav|mp3|ogg)$/i.test(m)){
+        return '<audio class="ap" controls preload="none" src="' + href +
+               '"></audio>' + link;
+      }
+      return link;
+    });
+  }
+
+  /* 把 agent 的文本日志转成步骤卡片，避免整块 <pre> 跟对话风格割裂 */
+  /* 插件返回的是 JSON（{"value":...} / {"text":...} / {"value":"| 表格 |"}），
+     直接 esc 出来就是一行 JSON，用户看不出内容。
+     这里解出有意义的字段，表格/公式再交给 render 渲染。 */
+  function pluginResultHtml(raw){
+    var t = String(raw || "");
+    if (/^\s*\{/.test(t)) {
+      try {
+        var j = JSON.parse(t);
+        if (j.error) return '<span class="err">' + esc(j.error) + '</span>';
+        var v = null, extra = [];
+        if (j.value !== undefined) v = j.value;
+        else if (j.answer !== undefined) v = j.answer;
+        else if (j.text !== undefined) v = j.text;
+        else if (j.factors !== undefined) v = "质因数：" + j.factors.join(" × ");
+        else if (j.sections !== undefined) v = "(PPT 章节已生成，共 " + (j.sections.length || 0) + " 节)";
+        else v = JSON.stringify(j, null, 1);
+
+        if (j.eq) extra.push("方程 " + j.eq);
+        if (j.values && j.values.length) extra.push("解 " + j.values.join(", "));
+        else if (j.var && j.value !== undefined) extra.push(j.var + " = " + j.value);
+        if (j.days !== undefined) extra.push("天数 " + j.days);
+        if (j.kind) extra.push(j.kind);
+        if (j.chars !== undefined) extra.push(j.chars + " 字符");
+
+        var h = render(String(v), false, true);
+        if (extra.length) h += '<div class="pmeta">' + esc(extra.join(" · ")) + '</div>';
+        return h;
+      } catch (e) { /* 不是合法 JSON 就原样显示 */ }
+    }
+    return render(t, false, true);
+  }
+
+  function renderAgentLog(text){
+    var src = String(text || "");
+    /* 自动化插件的输出没有「第 N 步 / 最终回答」这种结构，
+     * 走下面的解析会被当成噪音丢掉。这类输出整段原样渲染，
+     * 只滤掉框架自己的加载日志。 */
+    if (src.indexOf('── 第') < 0 && src.indexOf('最终回答') < 0) {
+      var clean = src.split("\n").filter(function(L){
+        return !/^(已加载:|自动化:|跳过 |任务:|插件:)/.test(L);
+      }).join("\n").replace(/^\s+|\s+$/g, "");
+      if (!clean) clean = "（没有输出）";
+      return '<div class="agent-wrap"><div class="astep-r full">'
+           + linkFiles(render(clean, false, true)) + '</div></div>';
+    }
+    var lines = String(text || "").split("\n");
+    var steps = [], tail = [], cur = null;
+    for (var i = 0; i < lines.length; i++){
+      var L = lines[i].replace(/\s+$/, "");
+      if (!L.trim()) continue;
+      if (/^(任务:|模型:)/.test(L)) continue;
+      var mStep = L.match(/^──\s*第\s*(\d+)\s*步\s*──/);
+      if (mStep){ cur = null; continue; }   /* 只做分隔，卡片由后面的"模型"行创建 */
+      var mCall = L.match(/^模型\s*\(([\d.]+)s\)\s*:\s*([\s\S]*)$/);
+      if (mCall){
+        var raw = mCall[2];
+        var mt = raw.match(/"tool"\s*:\s*"([a-zA-Z_]+)"/);
+        var tname = mt ? mt[1].toLowerCase() : "…";
+        /* final 不该显示成工具步骤，它的内容由下面的"最终回答"行负责 */
+        if (tname === "final"){ cur = null; continue; }
+        var ma = raw.match(/"(expr|path|cmd|question|content)"\s*:\s*"([^"]{0,60})/);
+        cur = {no:String(steps.length + 1), tool:tname,
+               arg: ma ? ma[2] : "", secs:mCall[1], result:""};
+        steps.push(cur);
+        continue;
+      }
+      var mRes = L.match(/^\s*\[([a-zA-Z_]+)\]\s*([\s\S]*)$/);
+      if (mRes && cur){ cur.result = mRes[2].trim(); continue; }
+      if (/^最终回答/.test(L)){
+        /* 多行答案要一直收到 [统计] 为止。否则 BOTTOM10 这种答案是
+           "标题 + 10 行数据"，只取第一行就只剩个空标题 ——
+           用户看到的正是"只有标题不展示数据"。 */
+        var finLines = [L.replace(/^最终回答[^:]*:\s*/, "")];
+        while (i + 1 < lines.length && !/^\[统计\]/.test(lines[i + 1])){
+          i++;
+          finLines.push(lines[i]);
+        }
+        tail.push({type:"final", text: finLines.join("\n")});
+        continue;
+      }
+      if (/^\[统计\]/.test(L)){ tail.push({type:"stat", text:L}); continue; }
+      if (/^(⚠|✗|!|↻|  ✗|  !|  ↻)/.test(L)){ tail.push({type:"warn", text:L.trim()}); continue; }
+      /* 都不匹配的行：当作上一条工具结果的续行（多行输出很常见） */
+      if (cur) cur.result += (cur.result ? "\n" : "") + L.trim();
+    }
+
+    var h = '<div class="agent-wrap">';
+    for (var k = 0; k < steps.length; k++){
+      var s = steps[k];
+      h += '<div class="astep"><div class="astep-h"><b>' + esc(s.no) + '</b>';
+      h += '<span class="chip">' + esc(s.tool) + '</span>';
+      if (s.arg) h += '<code>' + esc(s.arg) + '</code>';
+      if (s.secs) h += '<span class="secs">' + esc(s.secs) + 's</span>';
+      h += '</div>';
+      if (s.result){
+        /* 推理/正文类内容不截太狠：math 的推导有 500 字，截 260 就等于没了。
+           卡片本身有 max-height + 滚动，长内容能自己滚。 */
+        /* 插件结果的展示长度：解题过程是 markdown 表格，几百字节很正常，
+         * 截到 260 就等于把过程砍没了（用户看到"只有结果没有过程"）。
+         * 卡片自己有 max-height + 滚动，不怕长。 */
+        var limit = 4000;
+        var r = s.result.length > limit ? s.result.slice(0, limit) + " …" : s.result;
+        var full = " full";
+        h += '<div class="astep-r' + full + '">' + linkFiles(pluginResultHtml(r)) + '</div>';
+      }
+      h += '</div>';
+    }
+    for (var j = 0; j < tail.length; j++){
+      var o = tail[j];
+      if (o.type === "final") h += '<div class="afinal">' + linkFiles(render(o.text, false)) + '</div>';
+      else if (o.type === "stat") h += '<div class="astat">' + esc(o.text) + '</div>';
+      else h += '<div class="awarn">' + esc(o.text) + '</div>';
+    }
+    if (!steps.length && !tail.length){
+      h += '<div class="astep-r">' + esc(String(text || "（等待输出…）")) + '</div>';
+    }
+    return h + '</div>';
+  }
+  window.renderAgentLog = renderAgentLog;   /* 方便控制台调试/测试 */
+
+  /* ===== 文件上传：纯文本模型读不了 PDF/Word/Excel =====
+     上传时服务端就用 extract.py 转成 .txt，页面只记住文本路径；
+     发任务时把路径塞进任务里，agent 用 read 工具读。 */
+  var UPLOADS = [];                      // 本会话已上传的文本文件
+  var fileInput = document.getElementById("fileinput");
+  document.getElementById("upbtn").addEventListener("click", function(){
+    fileInput.click();
+  });
+  fileInput.addEventListener("change", function(){
+    var f = fileInput.files && fileInput.files[0];
+    fileInput.value = "";
+    if (!f) return;
+    if (f.size > 20 * 1024 * 1024){ toast("文件太大（上限 20MB）"); return; }
+    var fr = new FileReader();
+    fr.onload = function(){
+      var b64 = String(fr.result).split(",")[1] || "";
+      toast("上传并转换中… " + f.name, 60000);
+      fetch("/cgi-bin/agent?upload=1", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({name: f.name, data: b64})
+      }).then(function(r){ return r.json(); })
+        .then(function(j){
+          if (!j.ok) throw new Error(j.error || "上传失败");
+          UPLOADS.push({name: j.name, file: j.file, chars: j.chars, info: j.info});
+          /* 标明这次是谁解析的：builtin=内置文本，plugin=doc 插件 */
+          var how = j.builtin ? "内置文本"
+                  : (j.plugin ? (j.plugin + " 插件解析") : "");
+          var kindTxt = j.kind ? (" · " + j.kind) : "";
+          addMsg("bot", '<div class="awarn">已上传 <b>' + esc(j.name) + '</b>（'
+            + esc(kindTxt ? kindTxt.slice(3) : "文件") + '，' + j.chars + ' 字）'
+            + (how ? '<br><span style="color:#7c8794;font-size:11px">解析方式：'
+                     + esc(how) + '</span>' : '')
+            + '<br>现在已经转成纯文本，可以直接让我总结 / 翻译 / 就内容提问。</div>');
+          toast("");
+          scrollDown(true);
+        })
+        .catch(function(e){ toast(e.message || "上传失败"); });
+    };
+    fr.readAsDataURL(f);
+  });
+
+  function uploadsRef(){
+    if (!UPLOADS.length) return "";
+    return "【用户已上传的文件（服务端已转成纯文本，用 read 工具读）】\n"
+         + UPLOADS.map(function(u){ return u.file; }).join("\n")
+         + "\n\n";
+  }
+
+  function runAgent(task){
+    input.value = ""; autosize();
+    addMsg("user", render(task, false));
+    /* agent 的 JSON 约束会掐死数学推理：实测同一个 3B，纯对话能算对
+       （长宽比5:2对角线29 → 面积290），进 agent 模式只会瞎编式子。
+       检测到纯计算类任务就先提醒，别让用户白等五分钟。 */
+    if (/计算|算一下|求解|解方程|面积|周长|体积|比例.*求|多少平方|多少立方/.test(task)
+        && !/文件|目录|磁盘|系统|PPT|幻灯片|音乐|MIDI|下载|网页|抓/.test(task)) {
+      addMsg("bot", '<div class="awarn">这类计算/推理题在 Agent 模式下容易算错'
+        + '（JSON 约束让它没有推理空间，实测同一道题对话模式能算对）。'
+        + '建议切回「对话」模式问。任务仍会执行，但结果请自己核对。</div>');
+    }
+    /* agent 是独立会话，模型看不到页面上的对话。
+       用户说"这段代码 / 上面那个 / 刚才的文件"时，把最近几轮当参考带上，
+       否则它只能反问（页面是非交互的，反问等于失败）。 */
+    var ref = uploadsRef();
+    if (/这段|这个|上面|刚才|上次|前面|该代码|该文件|刚才那|继续|接着|再来|再生成|再做|下一个|同上|同样的|那首|那个曲子/.test(task)
+        && history.length) {
+      var ctx = history.slice(-2).map(function(m){
+        var c = String(m.content || "").replace(/\s+/g, " ").slice(0, 400);
+        return (m.role === "user" ? "用户: " : "回答: ") + c;
+      }).join("\n");
+      ref = "【参考上文，只用于理解指代，不要照搬】\n" + ctx + "\n\n【当前任务】\n";
+    }
+    var bubble = addMsg("bot", '<span class="typing"><i></i><i></i><i></i></span>');
+    bubble.classList.add("agent-bubble");
+    setBusy(true);
+    setTps("");
+
+    fetch("/cgi-bin/agent", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({task: ref + task, max_steps: 5})
+    }).then(function(r){ return r.json(); })
+      .then(function(j){
+        if (!j.ok) throw new Error(j.error || "启动失败");
+        pollAgent(j.job, bubble, Date.now(), task);
+      })
+      .catch(function(e){
+        bubble.innerHTML = '<span class="err">' + esc(e.message || "启动失败") + '</span>';
+        setBusy(false);
+      });
+  }
+
+  /* 启动自动化插件，两种方式：
+   *   daemon=false  前台跑一遍：开气泡、日志实时刷、跑完结束（不常驻）
+   *   daemon=true   后台守护：脱离会话常驻，面板显示运行中，随时可停
+   * 默认参数用插件自己的（sysmon 前台会自动收敛成有限轮次）。 */
+  function runAuto(name, daemon){
+    var panel = document.getElementById('envpanel');
+    if (panel) panel.classList.remove('show');
+    var q = "/cgi-bin/agent?auto=" + encodeURIComponent(name) +
+            (daemon ? "&daemon=1" : "") +
+            "&args=" + encodeURIComponent("{}");
+
+    if (daemon) {
+      /* 后台：不建气泡，只需要一条 toast + 面板状态刷新 */
+      fetch(q).then(function(r){ return r.json(); })
+        .then(function(j){
+          if (j.already) { toast(j.note || "已经在运行了", 4000); }
+          else if (!j.ok) { throw new Error(j.error || "启动失败"); }
+          else { toast("已在后台守护运行：" + name, 4000); }
+          setTimeout(function(){ if (window.refreshEnv) window.refreshEnv(); }, 800);
+        })
+        .catch(function(e){ toast("启动失败：" + (e.message || ""), 5000); });
+      return;
+    }
+
+    /* 前台：和普通任务一样的体验，日志实时显示 */
+    var bubble = addMsg("bot", '<span class="typing"><i></i><i></i><i></i></span>');
+    bubble.classList.add("agent-bubble");
+    setBusy(true);
+    setTps("");
+    fetch(q).then(function(r){ return r.json(); })
+      .then(function(j){
+        if (j.already) {
+          bubble.innerHTML = '<span class="warn">' + esc(j.note || "已经在运行了") + '</span>';
+          setBusy(false);
+          return;
+        }
+        if (!j.ok) throw new Error(j.error || "启动失败");
+        pollAgent(j.job, bubble, Date.now(), "auto:" + name);
+      })
+      .catch(function(e){
+        bubble.innerHTML = '<span class="err">' + esc(e.message || "启动失败") + '</span>';
+        setBusy(false);
+      });
+  }
+
+  /* 停止：给守护进程发 SIGTERM，插件在当前轮次结束后退出 */
+  function stopAuto(name){
+    fetch("/cgi-bin/agent?auto_stop=" + encodeURIComponent(name) + "&_=" + Date.now())
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        toast(j.stopped ? ("已停止：" + name) : (j.note || "没在运行"), 4000);
+        /* 状态交给 2 秒轮询去刷，不重建面板（重建会让滚动位置跳） */
+      })
+      .catch(function(e){ toast("停止失败：" + (e.message || ""), 5000); });
+  }
+
+  window.stopAuto = stopAuto;
+  window.runAuto = runAuto;     /* 面板那块 <script> 是另一个作用域，得挂出来 */
+
+  function pollAgent(job, bubble, t0, task){
+    fetch("/cgi-bin/agent?job=" + encodeURIComponent(job) + "&_=" + Date.now())
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        if (!j.ok){
+          bubble.innerHTML = '<span class="err">' + esc(j.error || "任务丢失") + '</span>';
+          setBusy(false);
+          return;
+        }
+        bubble.innerHTML = renderAgentLog(j.output || "");
+        /* 下载按钮：复制到记事本会因无 BOM 被按 GBK 解码而乱码，
+           下载成带 BOM 的 .txt 就不会了 */
+        if (!bubble.querySelector(".dl")){
+          var dl = document.createElement("button");
+          dl.className = "dl";
+          dl.textContent = "下载";
+          dl.title = "下载为带 BOM 的 UTF-8 文本（记事本打开不乱码）";
+          dl.onclick = function(){
+            var txt = (j.output || "").replace(/^(任务:|模型:).*\n/gm, "");
+            var blob = new Blob(["\ufeff" + txt],
+                                {type: "text/plain;charset=utf-8"});
+            var a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = "agent-" + job + ".txt";
+            a.click();
+            setTimeout(function(){ URL.revokeObjectURL(a.href); }, 3000);
+          };
+          bubble.appendChild(dl);
+        }
+        scrollDown(false);
+        var secs = ((Date.now() - t0) / 1000).toFixed(0);
+        setTps(j.done ? "完成 " + secs + "s" : "运行中 " + secs + "s");
+        if (j.done){
+          /* 把这次 agent 往来记进 history。agent 是独立会话（每次新进程），
+             不记的话用户再说"继续"或"再来一个"时它完全没有上下文，
+             实测会直接傻掉（或者瞎调工具）。 */
+          var fin = (j.output || "").match(/最终回答:\s*([\s\S]*?)\n\[统计\]/);
+          history.push({role: "user", content: "（Agent 任务）" + (task || "")});
+          history.push({role: "assistant",
+                        content: fin ? fin[1].trim() : "（已执行，详见步骤卡片）"});
+          setBusy(false);
+          return;
+        }
+        setTimeout(function(){ pollAgent(job, bubble, t0, task); }, 1500);
+      })
+      .catch(function(){
+        setTimeout(function(){ pollAgent(job, bubble, t0, task); }, 3000);
+      });
+  }
+
   function send(){
     var text = input.value.trim();
     if (!text || busy) return;
+    if (MODE === "agent"){ runAgent(text); return; }
     input.value = ""; autosize();
     history.push({role:"user", content:text});
     addMsg("user", render(text, false));
@@ -587,6 +1363,208 @@
   autosize();
   loadConf().then(function(ok){ if (ok) probe(); });
   input.focus();
+})();
+</script>
+<script>
+/* 顶部「环境与插件」按钮：点开看环境能力和已加载插件 */
+(function(){
+  var btn = document.getElementById('envbtn');
+  var panel = document.getElementById('envpanel');
+  if (!btn || !panel) return;
+
+  /* 这个 <script> 和主脚本是不同作用域，主脚本里的 esc() 在这里看不到，
+   * 之前直接用就抛 ReferenceError，被下面的 .catch 吞掉，
+   * 现象是"环境两组能显示、插件列表却空白"。这里补一份自己的。 */
+  function esc(s){
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  /* 一组 chip：cls=rt（底层运行时，蓝）/ lib（专用库，紫），缺失=灰 */
+  function chips(map, cls){
+    var keys = Object.keys(map || {});
+    if (!keys.length) return '<span class="grp">（无）</span>';
+    var h = '';
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      h += '<span class="chip ' + cls + (map[k] ? '' : ' off') + '"><i></i>' + k + '</span>';
+    }
+    return h;
+  }
+
+  function render(e){
+    document.getElementById('envrts').innerHTML = chips(e.runtimes, 'rt');
+    document.getElementById('envlibs').innerHTML = chips(e.libs, 'lib');
+
+    var ps = e.plugins || [];
+    var box = document.getElementById('envplugs');
+    if (!ps.length) {
+      box.innerHTML = '<div class="pitem"><b>（无）</b><span>plugins/ 目录里没有 .so</span></div>';
+      return;
+    }
+    var ph = '';
+    var nTool = 0, nAuto = 0;
+    for (var j = 0; j < ps.length; j++) {
+      var p = ps[j];
+      var isAuto = (p.kind === 'auto');
+      if (isAuto) nAuto++; else nTool++;
+      ph += '<div class="pitem' + (isAuto ? ' auto' : '') + '"'
+          + (isAuto ? ' data-key="' + esc(p.name) + '"' : '') + '>'
+          + '<b>' + esc(p.name) + '</b>'
+          + '<span class="pill">' + (isAuto ? '自动化' : '工具') + '</span>';
+      if (isAuto && p.triggers) ph += '<span class="trg">' + esc(p.triggers) + '</span>';
+      ph += '<span>' + esc(p.desc || '') + '</span>';
+      if (isAuto) {
+        var running = p.running ? 1 : 0;
+        ph += '<div class="astate ' + (running ? 'on' : 'off') + '">'
+            + (running ? '● 运行中' + (p.pid ? ' (pid ' + p.pid + ')' : '') : '○ 已停止')
+            + '</div>';
+        if (running) {
+          ph += '<button class="autoact stop" data-name="' + esc(p.name) + '"'
+              + ' data-act="stop">停止</button>';
+        } else {
+          /* 两种运行方式：
+           *   运行 = 前台跑一遍，日志实时刷在对话区，跑完就结束
+           *   守护 = 后台常驻，面板显示运行中，随时可停 */
+          ph += '<button class="autoact" data-name="' + esc(p.name) + '"'
+              + ' data-act="run">运行</button>';
+          ph += '<button class="autoact bg" data-name="' + esc(p.name) + '"'
+              + ' data-act="bg">守护</button>';
+        }
+      }
+      ph += '</div>';
+    }
+    box.innerHTML = ph;
+    /* 点"运行"启动自动化流程，复用任务日志轮询 */
+    box.onclick = function(ev){
+      var b = ev.target.closest ? ev.target.closest('.autoact') : null;
+      if (!b) return;
+      ev.stopPropagation();
+      var nm = b.getAttribute('data-name');
+      var act = b.getAttribute('data-act');
+      if (act === 'stop') {
+        if (window.stopAuto) window.stopAuto(nm);
+      } else if (act === 'bg') {
+        if (window.runAuto) window.runAuto(nm, true);    /* 后台守护 */
+      } else {
+        if (window.runAuto) window.runAuto(nm, false);   /* 前台跑一遍 */
+      }
+      /* 状态要刷一下，不然按钮文字还是旧的 */
+      setTimeout(function(){ if (window.refreshEnv) window.refreshEnv(); }, 1200);
+    };
+  }
+
+  /* ---- 自动化状态实时刷新 ----
+     面板开着的时候每 2 秒拉一次轻量状态（几十字节），只改状态文字和按钮，
+     不重建面板 —— 否则滚动位置会跳、按钮会闪。 */
+  var autoTimer = null;
+
+  function paintAutoState(name, running, pid){
+    var item = document.querySelector('#envplugs .pitem.auto[data-key="' + name + '"]');
+    if (!item) return;
+    var st = item.querySelector('.astate');
+    if (st) {
+      st.className = 'astate ' + (running ? 'on' : 'off');
+      st.textContent = running
+        ? ('● 运行中' + (pid ? ' (pid ' + pid + ')' : ''))
+        : '○ 已停止';
+    }
+    var btn = item.querySelector('.autoact');
+    var showingStop = btn && btn.getAttribute('data-act') === 'stop';
+    if (showingStop !== !!running) {          /* 状态变了才重建按钮，避免闪烁 */
+      var olds = item.querySelectorAll('.autoact');
+      for (var k = 0; k < olds.length; k++) olds[k].parentNode.removeChild(olds[k]);
+      if (running) {
+        item.insertAdjacentHTML('beforeend',
+          '<button class="autoact stop" data-name="' + name + '" data-act="stop">停止</button>');
+      } else {
+        item.insertAdjacentHTML('beforeend',
+          '<button class="autoact" data-name="' + name + '" data-act="run">运行</button>'
+          + '<button class="autoact bg" data-name="' + name + '" data-act="bg">守护</button>');
+      }
+    }
+  }
+
+  function pollAutoState(){
+    var panel = document.getElementById('envpanel');
+    if (!panel || !panel.classList.contains('show')) { stopAutoPoll(); return; }
+    if (document.hidden) return;              /* 页面在后台就别刷了 */
+    fetch('cgi-bin/agent?auto_state=1&_=' + Date.now(), {cache: 'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        (j.auto || []).forEach(function(a){ paintAutoState(a.name, a.running, a.pid); });
+      })
+      .catch(function(){ /* 网络抖动忽略，下次再刷 */ });
+  }
+
+  function startAutoPoll(){
+    if (autoTimer) return;
+    autoTimer = setInterval(pollAutoState, 2000);
+    pollAutoState();
+  }
+
+  function stopAutoPoll(){
+    if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+  }
+
+  /* 面板显示/隐藏自动接管轮询：开就刷，关就停，不用在每个关闭分支里手动调 */
+  if (window.MutationObserver) {
+    new MutationObserver(function(){
+      if (panel.classList.contains('show')) startAutoPoll();
+      else stopAutoPoll();
+    }).observe(panel, {attributes: true, attributeFilter: ['class']});
+  }
+  document.addEventListener('visibilitychange', function(){
+    if (!document.hidden) pollAutoState();
+  });
+
+  window.refreshEnv = load;
+
+  function load(){
+    fetch('cgi-bin/agent?env=1', {cache: 'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(d){ render((d && d.env) || {}); })
+      .catch(function(){});
+  }
+
+  btn.addEventListener('click', function(ev){
+    ev.stopPropagation();
+    var open = panel.classList.toggle('show');
+    if (open) load();
+  });
+  document.addEventListener('click', function(ev){
+    if (!panel.contains(ev.target) && !btn.contains(ev.target)) {
+      panel.classList.remove('show');
+    }
+  });
+  /* 不在这里 load()：页面刷新时不该去探环境（探库要跑子进程，
+   * 每刷新一次就烧几秒 CPU）。只在点开面板那一刻查。 */
+})();
+</script>
+<script>
+/* 左上角忙闲（问 CGI ?status=1，判据和提交任务时的互斥判断一致，
+ * 所以不会出现"显示空闲但提交被拒"） */
+(function(){
+  var el = document.getElementById('stat');
+  if (!el) return;
+  function setState(cls, text){
+    el.className = 'stat ' + cls;
+    el.textContent = text;
+  }
+  function tick(){
+    fetch('cgi-bin/agent?status=1', {cache: 'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (!d || !d.ok) { setState('unknown', '（未知）'); return; }
+        if (d.busy) setState('busy', '（忙碌）');
+        else setState('idle', '（空闲）');
+      })
+      .catch(function(){ setState('unknown', '（未知）'); });
+  }
+  setState('unknown', '（检测中）');
+  tick();
+  setInterval(tick, 3000);
 })();
 </script>
 </body>
