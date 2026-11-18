@@ -155,10 +155,13 @@ static jval *parse_object(jctx *c) {
 
         if (v->n >= cap) {
             cap *= 2;
+            /* 两次 realloc 必须分开判：前一个成功后 v->keys 已经指向新块，
+             * 后一个失败时再去 json_free 就会释放野指针 */
             char **nk = realloc(v->keys, (size_t)cap * sizeof(char *));
-            jval **ni = realloc(v->items, (size_t)cap * sizeof(jval *));
-            if (!nk || !ni) { free(k); json_free(val); json_free(v); return NULL; }
+            if (!nk) { free(k); json_free(val); json_free(v); return NULL; }
             v->keys = nk;
+            jval **ni = realloc(v->items, (size_t)cap * sizeof(jval *));
+            if (!ni) { free(k); json_free(val); json_free(v); return NULL; }
             v->items = ni;
         }
         v->keys[v->n] = k;

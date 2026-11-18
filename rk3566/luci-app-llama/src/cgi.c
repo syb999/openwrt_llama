@@ -12,6 +12,9 @@
  * 轮询时跨日查找（今天→昨天→保留期），23:59 起、00:01 查也能找到。
  */
 #include <stdio.h>
+#include <dlfcn.h>
+#include "plugin.h"
+#include "json.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -226,6 +229,32 @@ static int job_running(pid_t *pid_out) {
     return 0;
 }
 
+/* 停掉当前 agent 任务：读 .running 里的 pid，先 SIGTERM，
+ * 2 秒还在就 SIGKILL（卡在 socket read 里的进程走不到清理路径）。
+ * 前端"停止"按钮以前只 abort 了自己的 fetch，后端照跑 —— 用户点了没反应，
+ * 任务还一直占着 .running，后面所有任务都被"已有任务在跑"挡住。 */
+static void do_stop_job(void) {
+    char pf[600];
+    snprintf(pf, sizeof(pf), "%s/.running", JOBS);
+    FILE *f = fopen(pf, "r");
+    int pid = 0;
+    if (f) { if (fscanf(f, "%d", &pid) != 1) pid = 0; fclose(f); }
+    if (pid <= 0 || kill((pid_t)pid, 0) != 0) {
+        unlink(pf);
+        out_json("{\"ok\":1,\"stopped\":0,\"note\":\"没有在跑的任务\"}");
+        return;
+    }
+    kill((pid_t)pid, SIGTERM);
+    for (int i = 0; i < 20; i++) {          /* 最多等 2 秒 */
+        usleep(100000);
+        if (kill((pid_t)pid, 0) != 0) break;
+    }
+    int hard = 0;
+    if (kill((pid_t)pid, 0) == 0) { kill((pid_t)pid, SIGKILL); hard = 1; }
+    unlink(pf);
+    out_json("{\"ok\":1,\"stopped\":1,\"pid\":%d,\"hard\":%d}", pid, hard);
+}
+
 static void do_task(const char *body) {
     char task[8192] = {0};
     if (jget(body, "task", task, sizeof(task)) != 0 || !task[0]) {
@@ -270,7 +299,15 @@ static void do_task(const char *body) {
     if (pid == 0) {
         /* 子进程：stdout/stderr 都进日志 */
         int lf = open(logf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (lf >= 0) { dup2(lf, 1); dup2(lf, 2); if (lf > 2) close(lf); }
+        if (lf >= 0) { dup2(lf, 1); if (lf > 2) close(lf); }
+        /* stderr 进单独的 .err：主日志保持干净（[mem]/加载信息不该被前端
+         * 当成插件结果），出问题时还能翻 .err */
+        {
+            char erf[620];
+            snprintf(erf, sizeof(erf), "%s.err", logf);
+            int ef = open(erf, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (ef >= 0) { dup2(ef, 2); if (ef > 2) close(ef); }
+        }
         int nf = open("/dev/null", O_RDONLY);
         if (nf >= 0) { dup2(nf, 0); if (nf > 2) close(nf); }
         char steps[16];
@@ -334,7 +371,7 @@ static void do_poll(const char *jid) {
 
 /* ---------------- 环境 ---------------- */
 static void do_env(void) {
-    char buf[8192] = {0};
+    char buf[32768] = {0};      /* 插件多了之后 8K 会截断 */
     FILE *p = popen(AGENT_C " --env --plugins " PLUGIN_DIR " 2>/dev/null", "r");
     if (!p) { out_json("{\"ok\":0,\"error\":\"agent-c 执行失败\"}"); return; }
     size_t n = fread(buf, 1, sizeof(buf) - 1, p);
@@ -413,7 +450,15 @@ static void do_auto(const char *name, const char *args_json, int daemon_mode) {
          * 不受 uhttpd 的请求生命周期影响 */
         if (daemon_mode) setsid();
         int lf = open(logf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (lf >= 0) { dup2(lf, 1); dup2(lf, 2); if (lf > 2) close(lf); }
+        if (lf >= 0) { dup2(lf, 1); if (lf > 2) close(lf); }
+        /* stderr 进单独的 .err：主日志保持干净（[mem]/加载信息不该被前端
+         * 当成插件结果），出问题时还能翻 .err */
+        {
+            char erf[620];
+            snprintf(erf, sizeof(erf), "%s.err", logf);
+            int ef = open(erf, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (ef >= 0) { dup2(ef, 2); if (ef > 2) close(ef); }
+        }
         int nf = open("/dev/null", O_RDONLY);
         if (nf >= 0) { dup2(nf, 0); if (nf > 2) close(nf); }
         if (daemon_mode)
@@ -657,24 +702,33 @@ static void do_upload(const char *body) {
         return;
     }
 
-    char *txout = malloc(1 << 20);
-    if (txout) {
-        char cmd[1200];
-        snprintf(cmd, sizeof(cmd),
-            "python3 /opt/llama/agent/extract.py '%s' 2>/dev/null", path);
-        FILE *tp = popen(cmd, "r");
-        if (tp) {
-            size_t tn = fread(txout, 1, (1 << 20) - 1, tp);
-            txout[tn] = 0;
-            pclose(tp);
-            if (tn > 0) {
-                FILE *of = fopen(txtpath, "w");
-                if (of) { fwrite(txout, 1, tn, of); fclose(of); }
-                size_t ep = snprintf(esc_txt, sizeof(esc_txt), "%s", txtpath);
-                (void)ep;
+    /* 提取正文：直接调 doc 插件（dlopen），不再走 extract.py。
+     * 插件返回 {"text":"...","chars":N}，取 text 写成 .txt 伴生文件。 */
+    {
+        const char *ph = "/opt/llama/agent/plugins/doc.so";
+        void *dh = dlopen(ph, RTLD_NOW);
+        if (dh) {
+            plugin_desc_t *(*dentry)(void) =
+                (plugin_desc_t *(*)(void))dlsym(dh, "plugin_entry");
+            if (dentry) {
+                plugin_desc_t *dp = dentry();
+                char dreq[800];
+                snprintf(dreq, sizeof(dreq), "{\"path\":\"%s\"}", path);
+                char *dres = dp ? dp->run(dreq) : NULL;
+                if (dres) {
+                    char derr[128];
+                    jval *dj = json_parse(dres, derr, sizeof(derr));
+                    const char *dtxt = dj ? json_str(json_get(dj, "text")) : NULL;
+                    if (dtxt && dtxt[0]) {
+                        FILE *of = fopen(txtpath, "w");
+                        if (of) { fwrite(dtxt, 1, strlen(dtxt), of); fclose(of); }
+                    }
+                    if (dj) json_free(dj);
+                    free(dres);
+                }
             }
+            dlclose(dh);
         }
-        free(txout);
     }
 
     /* 输出：字段名跟页面一致（name/file/chars），并标明这次是插件解出来的 */
@@ -695,7 +749,7 @@ static void do_file(const char *fname) {
     const char *base = strrchr(fname, '/');
     base = base ? base + 1 : fname;
 
-    char cand[8][700];
+    char cand[24][700];
     int nc = 0;
     for (int d = 0; d <= KEEP_DAYS; d++) {
         char day[16];
@@ -704,6 +758,16 @@ static void do_file(const char *fname) {
     }
     snprintf(cand[nc++], 700, "%s/%s", WORK_DIR, base);
     snprintf(cand[nc++], 700, "%s/uploads/%s", WORK_DIR, base);
+    /* curl 抓回来的响应、doc 生成的文件都在这些子目录里，
+     * 少列一条就是"有下载按钮但点了说文件不存在"。 */
+    snprintf(cand[nc++], 700, "%s/downloads/%s", WORK_DIR, base);
+    snprintf(cand[nc++], 700, "%s/gen/%s", WORK_DIR, base);
+    for (int d = 0; d <= KEEP_DAYS; d++) {
+        char day[16];
+        today_str(day, sizeof(day), d);
+        snprintf(cand[nc++], 700, "%s/downloads/%s/%s", WORK_DIR, day, base);
+        snprintf(cand[nc++], 700, "%s/gen/%s/%s", WORK_DIR, day, base);
+    }
 
     const char *hit = NULL;
     for (int i = 0; i < nc; i++) {
@@ -818,6 +882,10 @@ int main(void) {
     if (penv && !strcmp(penv, "1")) { do_env(); return 0; }
     if (pfile && pfile[0])          { do_file(pfile); return 0; }
     if (pjob && pjob[0])            { do_poll(pjob); return 0; }
+    {
+        const char *pj = getenv("QUERY_STRING");
+        if (pj && strstr(pj, "stop_job=")) { do_stop_job(); return 0; }
+    }
 
     if (!strcasecmp(method, "POST")) {
         size_t blen = 0;

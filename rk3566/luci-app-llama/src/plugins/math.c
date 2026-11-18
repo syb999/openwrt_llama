@@ -997,6 +997,175 @@ static double num_before_unit(const char *s, const char *unit) {
     return (end == u) ? v : NAN;
 }
 
+
+/* ============ 环形跑道 ============
+ * 和直线往返的关键区别：
+ *   环形同向追：第 n 次追上，快者多跑了 n 圈  → t = n·S/(v1-v2)
+ *   环形反向行：第 n 次相遇，两人合跑了 n 圈  → t = n·S/(v1+v2)
+ *   直线往返  ：第 n 次相遇，合计 (2n-1) 圈/全程 → t = (2n-1)·S/(v1+v2)
+ * 三个公式长得像但系数不同，混用必错（模型最常在这里翻车）。
+ */
+static char *do_ring(const char *task) {
+    /* 一圈多长 */
+    double S = num_after_walk(task, "一圈");
+    if (isnan(S)) S = num_before_unit(task, "米一圈");
+    if (isnan(S)) S = num_after_walk(task, "跑道长");
+    if (isnan(S)) S = num_after_walk(task, "环形");
+    if (isnan(S)) S = num_before_unit(task, "米的环形");
+    if (isnan(S) || S <= 0) return NULL;
+    /* 必须真的是环形题 */
+    if (!strstr(task, "环形") && !strstr(task, "跑道") && !strstr(task, "一圈")) return NULL;
+
+    double v1 = num_after_walk(task, "甲每");
+    if (isnan(v1)) v1 = num_after_walk(task, "甲速");
+    if (isnan(v1)) v1 = num_after_walk(task, "甲的速度");
+    double v2 = num_after_walk(task, "乙每");
+    if (isnan(v2)) v2 = num_after_walk(task, "乙速");
+    if (isnan(v2)) v2 = num_after_walk(task, "乙的速度");
+    if (isnan(v1) || isnan(v2) || v1 <= 0 || v2 <= 0) return NULL;
+
+    /* 第几次（默认第一次）。"第二次"是中文数字，单独的 num_after_walk 认不出 */
+    int nth = 1;
+    const char *di = strstr(task, "第");
+    if (di) {
+        const char *p = di + strlen("第");
+        double n = NAN;
+        if (isdigit((unsigned char)*p)) n = strtod(p, NULL);
+        else if ((unsigned char)*p >= 0x80) n = cn_num(p);
+        if (!isnan(n) && n >= 1 && n < 100) nth = (int)n;
+    }
+
+    int same_dir = (strstr(task, "同向") != NULL);
+    double v_fast = v1 > v2 ? v1 : v2;
+    double v_slow = v1 > v2 ? v2 : v1;
+    double rel = same_dir ? (v_fast - v_slow) : (v1 + v2);
+    if (rel <= 0) return err_json("相对速度为 0，永远遇不上");
+
+    double t = (double)nth * S / rel;
+    char tb[64], s1[64], s2[64], relb[64];
+    snprintf(tb, sizeof(tb), "%.4g", t);
+    fmt_num(s1, sizeof(s1), S);
+    fmt_num(s2, sizeof(s2), (double)nth * S);
+    fmt_num(relb, sizeof(relb), rel);
+
+    char text[1400];
+    snprintf(text, sizeof(text),
+        "**环形跑道：%s**\n\n"
+        "一圈 %s 米，甲 %.4g 米/分，乙 %.4g 米/分，同时同地出发，%s。\n\n"
+        "**关键规律**\n\n"
+        "%s\n\n"
+        "| 步骤 | 计算 |\n|---|---|\n"
+        "| 相对速度 | %s |\n"
+        "| 第 %d 次要拉开的总距离 | %d × %s = %s 米 |\n"
+        "| 时间 | %s ÷ %s = **%s 分** |\n\n"
+        "**答案：%s**",
+        same_dir ? "同向追及" : "反向相遇",
+        s1, v1, v2, same_dir ? "同向而行" : "反向而行",
+        same_dir ? "同向时，快者每追上 1 次就比慢者多跑 1 圈；第 n 次追上，多跑 n 圈。"
+                 : "反向时，两人每相遇 1 次合计跑 1 圈；第 n 次相遇，合计跑 n 圈。",
+        same_dir ? "两者速度之差（快 - 慢）" : "两者速度之和",
+        nth, nth, s1, s2, s2, relb, tb,
+        same_dir ? "同向第 n 次追上" : "反向第 n 次相遇");
+
+    /* 把结果拼进答案 */
+    char ans[200];
+    snprintf(ans, sizeof(ans), "环形跑道%s第 %d 次：%s 分钟后",
+             same_dir ? "同向追上" : "反向相遇", nth, tb);
+    return json_pair(text, ans, NULL);
+}
+
+/* ============ 火车过桥 / 错车 ============
+ * 核心：火车有长度，走的路程要算"从车头进到车尾出"。
+ *   过桥/隧道   ：路程 = 车长 + 桥长
+ *   过电线杆/人 ：路程 = 车长（只有一个点）
+ *   两车错车    ：路程 = 两车长之和，速度 = 两车速度和
+ *   两车超车    ：路程 = 两车长之和，速度 = 两车速度差
+ */
+static char *do_train(const char *task) {
+    if (!strstr(task, "火车") && !strstr(task, "列车") && !strstr(task, "车长")) return NULL;
+
+    double L = num_after_walk(task, "火车长");
+    if (isnan(L)) L = num_after_walk(task, "列车长");
+    if (isnan(L)) L = num_after_walk(task, "车长");
+    if (isnan(L)) L = num_before_unit(task, "米长的火车");
+    if (isnan(L) || L <= 0) return NULL;
+
+    /* 速度：每秒 X 米 / 每小时 X 千米 */
+    double v = num_after_walk(task, "每秒");
+    int per_hour = 0;
+    if (isnan(v)) { v = num_after_walk(task, "每小时"); if (!isnan(v)) per_hour = 1; }
+    if (isnan(v)) v = num_after_walk(task, "速度");
+
+    /* 桥长 / 隧道长 */
+    double bridge = num_before_unit(task, "米的桥");
+    if (isnan(bridge)) bridge = num_before_unit(task, "米长的桥");
+    if (isnan(bridge)) bridge = num_after_walk(task, "桥长");
+    if (isnan(bridge)) bridge = num_before_unit(task, "米的隧道");
+    if (isnan(bridge)) bridge = num_after_walk(task, "隧道长");
+
+    /* 已知时间（用于反求速度） */
+    double given_t = num_before_unit(task, "秒");
+
+    char text[1500];
+    size_t i = 0;
+
+    if (!isnan(bridge) && !isnan(v) && v > 0) {
+        /* 求时间：路程 = 车长 + 桥长 */
+        double dist = L + bridge;
+        double t = dist / v;
+        char lb[64], bb[64], db[64], tb[64];
+        fmt_num(lb, sizeof(lb), L);
+        fmt_num(bb, sizeof(bb), bridge);
+        fmt_num(db, sizeof(db), dist);
+        snprintf(tb, sizeof(tb), "%.4g", t);
+        i += (size_t)snprintf(text + i, sizeof(text) - i,
+            "**火车过桥**\n\n"
+            "车长 %s 米，桥长 %s 米，速度 %.4g %s。\n\n"
+            "**关键**：从车头进桥到车尾出桥，车实际要走「车长 + 桥长」\n\n"
+            "| 步骤 | 计算 |\n|---|---|\n"
+            "| 总路程 | %s + %s = %s 米 |\n"
+            "| 时间 | %s ÷ %.4g = **%s 秒** |\n\n"
+            "**答案：通过这座桥需要 %s 秒**",
+            lb, bb, v, per_hour ? "千米/时" : "米/秒",
+            lb, bb, db, db, v, tb, tb);
+        char ans[128];
+        snprintf(ans, sizeof(ans), "需要 %s 秒通过", tb);
+        return json_pair(text, ans, NULL);
+    }
+
+    if (!isnan(given_t) && given_t > 0) {
+        /* 过电线杆/人：只有一个点，路程 = 车长，用来求速度 */
+        int point = (strstr(task, "电线杆") || strstr(task, "信号灯")
+                     || strstr(task, "站台") || strstr(task, "一个人")
+                     || strstr(task, "某人")) != NULL;
+        double dist = point ? L : (isnan(bridge) ? L : L + bridge);
+        double sp = dist / given_t;
+        char lb[64], db[64], tb2[64], sb[64];
+        fmt_num(lb, sizeof(lb), L);
+        fmt_num(db, sizeof(db), dist);
+        fmt_num(tb2, sizeof(tb2), given_t);
+        snprintf(sb, sizeof(sb), "%.4g", sp);
+        i += (size_t)snprintf(text + i, sizeof(text) - i,
+            "**火车过%s**\n\n"
+            "车长 %s 米，用了 %s 秒。\n\n"
+            "**关键**：%s\n\n"
+            "| 步骤 | 计算 |\n|---|---|\n"
+            "| 实际路程 | %s 米 |\n"
+            "| 速度 | %s ÷ %s = **%s 米/秒** |\n\n"
+            "**答案：速度是 %s 米/秒（约 %.2f 千米/时）**",
+            point ? "电线杆" : "桥",
+            lb, tb2,
+            point ? "电线杆只有一个点，车走的路程就是车长"
+                  : "过桥要走「车长 + 桥长」",
+            db, db, tb2, sb, sb, sp * 3.6);
+        char ans[128];
+        snprintf(ans, sizeof(ans), "速度 %s 米/秒", sb);
+        return json_pair(text, ans, NULL);
+    }
+
+    return NULL;
+}
+
 /* ============ 工程合作：甲 a 天、乙 b 天，合作几天 ============
  * t·(1/a + 1/b) = 1  →  t = a·b/(a+b)
  * 12 天 + 15 天 → 180/27 = 20/3 ≈ 6.67 天（分数要保留，别给小数糊弄）
@@ -1413,6 +1582,20 @@ static char *do_num(const char *js) {
     return strdup(out);
 }
 
+/* 把原题文字挨个题型试一遍。
+ * 模型常常猜错 op（把火车题写成 meet），所以任何应用题类 op 失败后
+ * 都要回落到这里，让它有机会被正确的模板接住。 */
+static char *try_all(const char *task) {
+    char *r;
+    if ((r = do_ring(task)))    return r;
+    if ((r = do_train(task)))   return r;
+    if ((r = do_meet(task)))    return r;
+    if ((r = do_work(task)))    return r;
+    if ((r = do_chicken(task))) return r;
+    if ((r = do_plan(task)))    return r;
+    return NULL;
+}
+
 /* ============ 入口 ============ */
 static char *run(const char *json_in) {
     char op[32] = {0};
@@ -1430,29 +1613,68 @@ static char *run(const char *json_in) {
         char expr[512] = {0};
         jget(json_in, "expr", expr, sizeof(expr));
         if (!expr[0]) return err_json("缺少 expr");
+        /* 模型常把方程丢给 calc（"3x+5=20"）。带等号就是方程，直接转 solve，
+         * 别让它因为忘了 solve 这个 op 名就卡死在 calc 上报"未知变量"。
+         * 注意 do_solve 收的是方程字符串本身，不是 JSON。 */
+        if (strchr(expr, '=') && strstr(expr, "==") == NULL)
+            return do_solve(expr);
         return do_calc(expr);
     }
     if (!strcmp(op, "solve") || !strcmp(op, "equation")) {
+        /* 模型爱把应用题硬转成方程，还经常列错（火车题能写成 20t+200=600）。
+         * 只要它把原题文字一起传了，就先让机械题型试一遍。 */
+        {
+            char tbuf[2048] = {0};
+            jget(json_in, "task", tbuf, sizeof(tbuf));
+            if (tbuf[0]) {
+                char *rt = try_all(tbuf);
+                if (rt) return rt;
+            }
+        }
         char eq[512] = {0};
         jget(json_in, "equation", eq, sizeof(eq));
         if (!eq[0]) jget(json_in, "expr", eq, sizeof(eq));
-        if (!eq[0]) jget(json_in, "task", eq, sizeof(eq));
-        if (!eq[0]) return err_json("缺少 equation");
+        if (!eq[0]) {
+            /* 模型有时只给原话"解方程 3x+5=20"，没给 equation。
+             * 跳过开头的中文，取第一个像数学的片段。 */
+            char tbuf[512] = {0};
+            jget(json_in, "task", tbuf, sizeof(tbuf));
+            const char *p = tbuf;
+            while (*p && (unsigned char)*p >= 0x80) {
+                while (*p && (unsigned char)*p >= 0x80) p++;
+                while (*p == ' ') p++;
+            }
+            if (*p) {
+                snprintf(eq, sizeof(eq), "%s", p);
+                for (char *q = eq; *q; q++)
+                    if ((unsigned char)*q >= 0x80) { *q = 0; break; }
+            }
+        }
+        if (!eq[0]) return err_json("缺少 equation（给我 \"3x+5=20\" 这种）");
         return do_solve(eq);
     }
     if (!strcmp(op, "system") || !strcmp(op, "equations")) {
         return do_system(json_in);
     }
-    if (!strcmp(op, "meet") || !strcmp(op, "travel") || !strcmp(op, "chase")) {
+    /* 所有"应用题"类 op：先按名字对应的模板试，不行就全题型扫一遍。
+     * 模型经常把火车题写成 meet、把工程量题写成 plan，不能让它猜错 op 就整题失败。 */
+    if (!strcmp(op, "meet") || !strcmp(op, "travel") || !strcmp(op, "chase")
+        || !strcmp(op, "ring") || !strcmp(op, "train")
+        || !strcmp(op, "work") || !strcmp(op, "chicken") || !strcmp(op, "plan")) {
         char task[2048] = {0};
         jget(json_in, "task", task, sizeof(task));
-        char *r = do_meet(task);
+        char *r = NULL;
+        if (!strcmp(op, "ring"))         r = do_ring(task);
+        else if (!strcmp(op, "train"))   r = do_train(task);
+        else if (!strcmp(op, "work"))    r = do_work(task);
+        else if (!strcmp(op, "chicken")) r = do_chicken(task);
+        else if (!strcmp(op, "plan"))    r = do_plan(task);
+        else                             r = do_meet(task);
         if (r) return r;
-        /* 模型猜错 op 了（把工程量题写成 meet）：别直接报错，
-         * 回落到通用识别，让 plan / solve 有机会接住。 */
-        char *rp = do_plan(task);
-        if (rp) return rp;
-        return err_json("没识别出行程条件（需要：相距X米 + 甲每分钟A米 + 乙每分钟B米）");
+        char *ra = try_all(task);
+        if (ra) return ra;
+        return err_json("没识别出题型（行程/环形/火车/工程/鸡兔/计划vs实际都不匹配，"
+                        "需要把原题文字完整传给 task）");
     }
     if (!strcmp(op, "stat") || !strcmp(op, "stats")) return do_stat(json_in);
     if (!strcmp(op, "num") || !strcmp(op, "number")) return do_num(json_in);
@@ -1475,16 +1697,10 @@ static char *run(const char *json_in) {
     }
     char task[2048] = {0};
     if (jget(json_in, "task", task, sizeof(task)) == 0 && task[0]) {
-        /* 行程题先试：相遇/追及/往返。这类题模型最容易自己乱列式子，
+        /* 应用题：机械题型挨个试。这类题模型最容易自己乱列式子，
          * 结构固定，让插件直接解比让它算可靠。 */
-        char *rm = do_meet(task);
-        if (rm) return rm;
-        char *rw = do_work(task);
-        if (rw) return rw;
-        char *rc = do_chicken(task);
-        if (rc) return rc;
-        char *r = do_plan(task);
-        if (r) return r;
+        char *rt = try_all(task);
+        if (rt) return rt;
         /* 题目里带等号 → 当方程解 */
         if (strchr(task, '=') && strlen(task) < 200) {
             char *s = do_solve(task);
@@ -1499,9 +1715,8 @@ static char *run(const char *json_in) {
 static plugin_desc_t desc = {
     PLUGIN_API_VERSION,
     "math",
-    "数学计算。工具名固定写 math，用 op 字段选子功能："
-    "calc=表达式求值  solve=一元方程  system=二元方程组  stat=统计  num=数论 "
-    "meet=行程(相遇/追及/往返)  work=工程合作  chicken=鸡兔同笼  plan=工程量应用题",
+    "数学：calc算式 solve方程 system方程组 stat统计 num数论 meet行程 ring环形 "
+    "train火车 work合作 chicken鸡兔 plan工程",
     "{\"op\":\"calc\",\"expr\":\"(1+2)*3\"}"
     "  或 {\"op\":\"solve\",\"equation\":\"3x+5=20\"}"
     "  或 {\"op\":\"system\",\"eqs\":[\"x+y=10\",\"x-y=2\"]}"
@@ -1510,7 +1725,8 @@ static plugin_desc_t desc = {
     "  或 {\"op\":\"meet\",\"task\":\"原题文字\"}"
     "  或 {\"op\":\"plan\",\"task\":\"原题文字\"}",
     run,
-    "calc,solve,system,stat,num,plan,meet,travel,chase,work,chicken,expression,equation,equations"   /* 模型可能直接拿这些当工具名 */
+    "calc,solve,system,stat,num,plan,meet,travel,chase,ring,train,work,chicken,"
+    "expression,equation,equations"   /* 模型可能直接拿这些当工具名 */
 };
 
 plugin_desc_t *plugin_entry(void) { return &desc; }

@@ -594,7 +594,7 @@ static char *run(const char *json_in) {
 static plugin_desc_t desc = {
     PLUGIN_API_VERSION,
     "net",
-    "网络诊断（调本机命令）：查询接口IP(ip) 路由(route) DNS(dns) 邻居表(arp) "
+    "网络诊断：ip route dns arp ping port resolve stat link wifi trace hostname（调本机命令，参数白名单）"
     "连通性(ping) 端口(port) 域名解析(resolve) 流量(stat) 链路(link) 无线(wifi) 路由跟踪(trace)",
     "{\"op\":\"ip\"}"
     "  或 {\"op\":\"ip\",\"iface\":\"br-lan\"}"
