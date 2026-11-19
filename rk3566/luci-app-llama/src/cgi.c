@@ -104,10 +104,18 @@ static char *read_body(size_t *len) {
 static int jget(const char *js, const char *key, char *out, size_t cap) {
     char pat[96];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(js, pat);
-    if (!p) return -1;
-    p = strchr(p + strlen(pat), ':');
-    if (!p) return -1;
+    /* 只认「后面紧跟冒号」的匹配：字段值恰好等于某个 key 名时会误命中
+     * （{"op":"query",...,"query":"x"} 找 query 会先撞上 op 的值），
+     * 那样解析出来的就是隔壁字段。 */
+    const char *p = js, *found = NULL;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *q = p + strlen(pat);
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == ':') { found = q; break; }
+        p = q;
+    }
+    if (!found) return -1;
+    p = found;
     p++;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     if (*p != '"') return -1;
@@ -233,6 +241,40 @@ static int job_running(pid_t *pid_out) {
  * 2 秒还在就 SIGKILL（卡在 socket read 里的进程走不到清理路径）。
  * 前端"停止"按钮以前只 abort 了自己的 fetch，后端照跑 —— 用户点了没反应，
  * 任务还一直占着 .running，后面所有任务都被"已有任务在跑"挡住。 */
+/* ?set_plugoff=music,batch → 写 /etc/llama.plugoff（一行一个）
+ * 被停用的插件下次 agent 启动时就不加载了：prompt 里的工具表变短，
+ * 3B 选错率下降，每步也快。 */
+static void do_set_plugoff(const char *val) {
+    FILE *f = fopen("/etc/llama.plugoff", "w");
+    if (!f) {
+        out_json("{\"ok\":0,\"error\":\"写不了 /etc/llama.plugoff（只读文件系统？）\"}");
+        return;
+    }
+    int n = 0;
+    const char *p = val;
+    while (*p) {
+        const char *c = strchr(p, ',');
+        size_t L = c ? (size_t)(c - p) : strlen(p);
+        /* 只收字母数字下划线，长度合理；其它一律丢掉，避免写进脏东西 */
+        int ok = (L > 0 && L < 32);
+        for (size_t i = 0; ok && i < L; i++) {
+            char ch = p[i];
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+                  || (ch >= '0' && ch <= '9') || ch == '_'))
+                ok = 0;
+        }
+        if (ok) {
+            fwrite(p, 1, L, f);
+            fputc('\n', f);
+            n++;
+        }
+        if (!c) break;
+        p = c + 1;
+    }
+    fclose(f);
+    out_json("{\"ok\":1,\"disabled\":%d}", n);
+}
+
 static void do_stop_job(void) {
     char pf[600];
     snprintf(pf, sizeof(pf), "%s/.running", JOBS);
@@ -762,6 +804,8 @@ static void do_file(const char *fname) {
      * 少列一条就是"有下载按钮但点了说文件不存在"。 */
     snprintf(cand[nc++], 700, "%s/downloads/%s", WORK_DIR, base);
     snprintf(cand[nc++], 700, "%s/gen/%s", WORK_DIR, base);
+    /* browser 插件失败时截的现场图 */
+    snprintf(cand[nc++], 700, "%s/shots/%s", WORK_DIR, base);
     for (int d = 0; d <= KEEP_DAYS; d++) {
         char day[16];
         today_str(day, sizeof(day), d);
@@ -780,18 +824,26 @@ static void do_file(const char *fname) {
 
     const char *ext = strrchr(base, '.');
     const char *ct = "application/octet-stream";
+    int is_img = 0;
     if (ext) {
         if (!strcasecmp(ext, ".mid") || !strcasecmp(ext, ".midi")) ct = "audio/midi";
         else if (!strcasecmp(ext, ".mp3")) ct = "audio/mpeg";
         else if (!strcasecmp(ext, ".wav")) ct = "audio/wav";
         else if (!strcasecmp(ext, ".pptx")) ct = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+        else if (!strcasecmp(ext, ".png")) { ct = "image/png"; is_img = 1; }
+        else if (!strcasecmp(ext, ".jpg") || !strcasecmp(ext, ".jpeg")) { ct = "image/jpeg"; is_img = 1; }
+        else if (!strcasecmp(ext, ".gif")) { ct = "image/gif"; is_img = 1; }
+        else if (!strcasecmp(ext, ".webp")) { ct = "image/webp"; is_img = 1; }
         else if (!strcasecmp(ext, ".txt") || !strcasecmp(ext, ".md") || !strcasecmp(ext, ".py"))
             ct = "text/plain; charset=utf-8";
     }
     struct stat st;
     if (stat(hit, &st) != 0) { out_json("{\"ok\":0,\"error\":\"stat 失败\"}"); return; }
     printf("Content-Type: %s\r\n", ct);
-    printf("Content-Disposition: attachment; filename=\"%s\"\r\n", base);
+    /* 图片给 inline —— 页面里要用 <img src="...?file=x.png"> 直接显示；
+     * 其它类型还是 attachment，点了就下载 */
+    printf("Content-Disposition: %s; filename=\"%s\"\r\n",
+           is_img ? "inline" : "attachment", base);
     printf("Content-Length: %lld\r\n", (long long)st.st_size);
     printf("Cache-Control: no-store\r\n\r\n");
     fflush(stdout);
@@ -885,6 +937,16 @@ int main(void) {
     {
         const char *pj = getenv("QUERY_STRING");
         if (pj && strstr(pj, "stop_job=")) { do_stop_job(); return 0; }
+        if (pj && strstr(pj, "set_plugoff=")) {
+            const char *v = strstr(pj, "set_plugoff=") + 12;
+            char pv[512];
+            size_t pl = strcspn(v, "&");
+            if (pl >= sizeof(pv)) pl = sizeof(pv) - 1;
+            memcpy(pv, v, pl);
+            pv[pl] = 0;
+            do_set_plugoff(pv);
+            return 0;
+        }
     }
 
     if (!strcasecmp(method, "POST")) {

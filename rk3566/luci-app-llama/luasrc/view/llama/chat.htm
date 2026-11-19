@@ -29,7 +29,13 @@
 	</div>
 
 	<div class="llama-frame-wrap">
-		<iframe id="llama-frame" src="/llama.htm?embed=1" title="<%:Local AI Chat%>"></iframe>
+		<%-
+			-- 给 iframe 的 URL 带上构建时间戳：不这么做的话浏览器会一直用
+			-- 缓存的旧 /llama.htm，改了前端页面用户看不到（iframe 的缓存
+			-- 比普通页面更顽固，强刷主页也不一定管用）。
+			local v = "20261119c"
+		-%>
+		<iframe id="llama-frame" src="/llama.htm?embed=1&amp;v=<%=v%>" title="<%:Local AI Chat%>"></iframe>
 	</div>
 </div>
 

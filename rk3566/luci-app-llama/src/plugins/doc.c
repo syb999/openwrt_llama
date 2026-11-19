@@ -24,10 +24,18 @@
 static int jget(const char *js, const char *key, char *out, size_t cap) {
     char pat[96];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(js, pat);
-    if (!p) return -1;
-    p = strchr(p + strlen(pat), ':');
-    if (!p) return -1;
+    /* 只认「后面紧跟冒号」的匹配：字段值恰好等于某个 key 名时会误命中
+     * （{"op":"query",...,"query":"x"} 找 query 会先撞上 op 的值），
+     * 那样解析出来的就是隔壁字段。 */
+    const char *p = js, *found = NULL;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *q = p + strlen(pat);
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == ':') { found = q; break; }
+        p = q;
+    }
+    if (!found) return -1;
+    p = found;
     p++;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     if (*p != '"') return -1;
@@ -207,13 +215,17 @@ static char *run(const char *json_in) {
                   "sys.stdout.write(chr(10).join(out))\n", sf);
             fclose(sf);
             char cmd[700];
-            snprintf(cmd, sizeof(cmd), "python3 %s '%s' 2>/dev/null", sp, path);
+            /* 不要把 stderr 全吞掉：pypdf 真报错（比如 ImportError）时
+             * 用户看到的永远是"没装 pypdf"，实际是别的错，没法排查。 */
+            snprintf(cmd, sizeof(cmd), "python3 %s '%s'", sp, path);
             txt = sh(cmd);
         }
         if (!txt || !txt[0]) {
             free(txt);
-            return strdup("{\"error\":\"PDF 读不出文字：板上没装 pypdf（pip install pypdf），"
-                          "或这份 PDF 没有文本层（扫描件需要 OCR）\"}");
+            /* pypdf 已装但提取为空，最常见是 PDF 本身没有文本层（图片版/
+             * 扫描件）。以前这里一律说"没装 pypdf"，把人带偏。 */
+            return strdup("{\"error\":\"PDF 读不出文字：这份 PDF 大概率没有文本层"
+                          "（扫描件或图片版，需要 OCR 才能读）。文字版 PDF 才走 pypdf\"}");
         }
     } else {
         txt = doc_extract(path, dot);

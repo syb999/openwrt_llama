@@ -32,10 +32,18 @@
 static int jget(const char *js, const char *key, char *out, size_t cap) {
     char pat[64];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(js, pat);
-    if (!p) return -1;
-    p = strchr(p + strlen(pat), ':');
-    if (!p) return -1;
+    /* 只认「后面紧跟冒号」的匹配：字段值恰好等于某个 key 名时会误命中
+     * （{"op":"query",...,"query":"x"} 找 query 会先撞上 op 的值），
+     * 那样解析出来的就是隔壁字段。 */
+    const char *p = js, *found = NULL;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *q = p + strlen(pat);
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == ':') { found = q; break; }
+        p = q;
+    }
+    if (!found) return -1;
+    p = found;
     p++;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     if (*p != '"') return -1;
@@ -178,6 +186,9 @@ static int cmd_allowed(const char *cmd, char *why, size_t whycap) {
         "uname", "uptime", "ps", "date", "echo", "stat", "file", "which",
         "sort", "uniq", "cut", "tr", "awk", "sed", "id", "pwd", "tree",
         "jq", "python", "python3", "node", "npm", "npx", "ip", "iw", "uci",
+        /* sh/ash/busybox：跑用户自己写的脚本。已经允许 python3 x.py、node x.js，
+         * 独独不给 sh x.sh 说不过去 —— "写个 shell 脚本" 这类任务写完就没法执行。 */
+        "sh", "ash", "busybox",
         "logread", "uptime", "mount", "lsusb", "dmesg", "hostname", "netstat",
         NULL
     };
@@ -276,10 +287,55 @@ static int cmd_allowed(const char *cmd, char *why, size_t whycap) {
     return 1;
 }
 
+/* 命令里有没有"能改文件/删文件/刷设备"的动作。
+ *
+ * 白名单挡住了 rm/mv/dd，但挡不住这些：sed -i 原地改、find -delete 批量删、
+ * awk 的重定向写、python3/node 跑任意脚本（我自己救板子就是这么干的）。
+ * 这些不禁止，但必须由用户在页面上确认过才能跑。
+ */
+static const char *cmd_dangerous(const char *cmd) {
+    static const struct { const char *needle; const char *label; } P[] = {
+        { "sed -i",      "sed -i 原地改文件" },
+        { "-delete",     "find -delete 批量删除" },
+        { "truncate",    "truncate 清空文件" },
+        { "shred",       "shred 粉碎文件" },
+        { "chmod",       "chmod 改权限" },
+        { "chown",       "chown 改属主" },
+        { ">>",          ">> 追加写入文件" },
+        { "python3",     "python3 跑脚本（等同任意代码）" },
+        { "node",        "node 跑脚本（等同任意代码）" },
+        { "reboot",      "重启" },
+        { "kill",        "杀进程" },
+        { NULL, NULL }
+    };
+    if (!cmd) return NULL;
+    for (int i = 0; P[i].needle; i++)
+        if (strstr(cmd, P[i].needle)) return P[i].label;
+    /* 单个 > 重定向也算（上面对 >> 已经处理，这里补 > 到文件） */
+    for (const char *p = cmd; (p = strchr(p, '>')) != NULL; p++) {
+        if (p[1] == '&') continue;          /* 2>&1 之类不算 */
+        if (p > cmd && p[-1] == '>') continue;
+        return "> 重定向写文件";
+    }
+    return NULL;
+}
+
 static char *op_shell(const char *json) {
     char cmd[2048] = {0};
+    char confirm[16] = {0};
     jget(json, "cmd", cmd, sizeof(cmd));
+    jget(json, "confirm", confirm, sizeof(confirm));
     if (!cmd[0]) return jerr("缺少 cmd");
+
+    /* 能改文件的命令，必须由用户确认过（前端弹窗点"确认执行"才会补这个字段） */
+    const char *dg = cmd_dangerous(cmd);
+    if (dg && strcmp(confirm, "yes")) {
+        char m[600];
+        snprintf(m, sizeof(m),
+            "这条命令会改系统状态（%s），需要用户在页面上确认后才能执行。"
+            "确认后前端会自动带上 confirm:\"yes\"。", dg);
+        return jerr(m);
+    }
 
     char why[256] = {0};
     if (!cmd_allowed(cmd, why, sizeof(why))) {
@@ -287,7 +343,7 @@ static char *op_shell(const char *json) {
         snprintf(msg, sizeof(msg),
             "拒绝执行：%s。可用命令：ls cat head tail wc grep find du df free uname "
             "uptime ps date echo stat file which sort uniq cut tr awk sed id pwd tree "
-            "jq ip iw uci logread + python3 xxx.py / node xxx.js，可以用 | 管道。", why);
+            "jq ip iw uci logread + python3 xxx.py / node xxx.js / sh xxx.sh，可以用 | 管道。", why);
         return jerr(msg);
     }
 
@@ -392,7 +448,12 @@ static char *op_du(const char *json) {
     resolve_path(p, path, sizeof(path));
 
     struct stat st;
-    if (stat(path, &st) != 0) { char m[900]; snprintf(m, sizeof(m), "不存在：%s", path); return jerr(m); }
+    if (stat(path, &st) != 0) {
+        char m[900];
+        snprintf(m, sizeof(m), "路径不存在：%s。常搜的位置：/var/log（系统日志）、"
+                               "/etc/config（UCI 配置）、/tmp、/www", path);
+        return jerr(m);
+    }
 
     long long files = 0;
     long long total = walk_size(path, 0, &files);
@@ -412,7 +473,10 @@ static char *op_grep(const char *json) {
     char pat[256] = {0}, p[512] = {0};
     jget(json, "pattern", pat, sizeof(pat));
     jget(json, "path", p, sizeof(p));
-    if (!pat[0]) return jerr("缺少 pattern");
+    if (!pat[0])
+        return jerr("缺少 pattern（要搜的关键字）。正确写法："
+                    "{\"op\":\"grep\",\"pattern\":\"404\",\"path\":\"/var/log\"}；"
+                    "path 省略时在 . 下搜，max_hits 默认 30");
     char path[768];
     resolve_path(p[0] ? p : ".", path, sizeof(path));
     long maxh = jget_int(json, "max_hits", 30);
@@ -420,7 +484,12 @@ static char *op_grep(const char *json) {
     int icase = jget_int(json, "icase", 1);
 
     struct stat st;
-    if (stat(path, &st) != 0) { char m[900]; snprintf(m, sizeof(m), "不存在：%s", path); return jerr(m); }
+    if (stat(path, &st) != 0) {
+        char m[900];
+        snprintf(m, sizeof(m), "路径不存在：%s。常搜的位置：/var/log（系统日志）、"
+                               "/etc/config（UCI 配置）、/tmp、/www", path);
+        return jerr(m);
+    }
 
     char *out = malloc(OUTMAX);
     if (!out) return NULL;
@@ -753,17 +822,29 @@ static char *op_http_get(const char *json) {
     long maxc = jget_int(json, "max_chars", 3000);
     if (maxc <= 0 || maxc > 20000) maxc = 3000;
 
-    char cmd[1400];
+    /* 先拿 HTTP 状态码，再抓正文。
+     * 原来是 wget -q 一把梭：4xx/5xx 时 wget 不输出正文，于是被判成
+     * "抓取失败"——可用户问的往往就是"这个链接是不是 404"，状态码才是
+     * 他要的答案。curl 能同时给状态码和正文（含错误页）。 */
+    char cmd[1600];
     snprintf(cmd, sizeof(cmd),
-        "wget -q -T 20 -O - '%s' 2>/dev/null | head -c %ld", url, maxc * 6L);
+        "curl -s -o /dev/null -w '%%{http_code}' --max-time 20 -L '%s' 2>/dev/null", url);
+    char code[64] = {0};
+    int tr0 = 0;
+    run_sh(cmd, 25, code, sizeof(code), &tr0);
+    long status = (code[0] >= '1' && code[0] <= '5') ? atol(code) : 0;
+
+    snprintf(cmd, sizeof(cmd),
+        "curl -sL --max-time 20 '%s' 2>/dev/null | head -c %ld", url, maxc * 6L);
     char *raw = malloc(OUTMAX);
     if (!raw) return NULL;
     int tr = 0;
     run_sh(cmd, 25, raw, OUTMAX, &tr);
 
-    if (!raw[0]) {
+    if (!raw[0] && !status) {
         free(raw);
-        return jerr("抓取失败（网络不通或站点拒绝）");
+        return jerr("连不上（DNS 解析失败 / 网络不通 / 站点拒绝连接）。"
+                    "先确认网址和网络，或用 ping、resolve 检查");
     }
     /* 粗略剥 HTML：去掉 <...>，压缩空行，保留正文 */
     char *clean = malloc(OUTMAX);
@@ -785,9 +866,24 @@ static char *op_http_get(const char *json) {
     free(raw);
 
     char text[OUTMAX];
-    snprintf(text, sizeof(text), "抓取 `%s`：\n\n```\n%s\n```", url, clean[0] ? clean : "(内容为空)");
-    char ans[260];
-    snprintf(ans, sizeof(ans), "已抓取 %s（%zu 字）", url, ci);
+    const char *meaning = "";
+    if (status == 200) meaning = "正常";
+    else if (status == 301 || status == 302) meaning = "重定向（已跟随）";
+    else if (status == 403) meaning = "禁止访问";
+    else if (status == 404) meaning = "页面不存在";
+    else if (status == 500) meaning = "服务器错误";
+    else if (status >= 400) meaning = "客户端/服务端报错";
+    if (status)
+        snprintf(text, sizeof(text),
+                 "**HTTP %ld** %s\n\n抓取 `%s`：\n\n```\n%s\n```",
+                 status, meaning, url, clean[0] ? clean : "(内容为空)");
+    else
+        snprintf(text, sizeof(text), "抓取 `%s`（未拿到状态码）：\n\n```\n%s\n```",
+                 url, clean[0] ? clean : "(内容为空)");
+
+    char ans[300];
+    if (status) snprintf(ans, sizeof(ans), "%s → HTTP %ld %s", url, status, meaning);
+    else snprintf(ans, sizeof(ans), "已抓取 %s（%zu 字）", url, ci);
     char *r = jpair(text, ans);
     free(clean);
     return r;
@@ -868,14 +964,30 @@ static char *run(const char *json_in) {
     if (!strcmp(op, "http_get") || !strcmp(op, "http"))              return op_http_get(json_in);
     if (!strcmp(op, "download") || !strcmp(op, "wget"))              return op_download(json_in);
 
-    return jerr("不支持的 op：shell/list/du/grep/read/write/sysinfo/http_get/download");
+    {
+        char m[760];
+        if (!op[0])
+            snprintf(m, sizeof(m),
+                "缺少 op（sys 不会自己猜）。支持的 op：shell / list / du / grep / "
+                "read / write / sysinfo / http_get / download。\n"
+                "抓网页：{\"op\":\"http_get\",\"url\":\"http://example.com\"}；"
+                "列目录：{\"op\":\"list\",\"path\":\"/tmp\"}；"
+                "搜索：{\"op\":\"grep\",\"pattern\":\"404\",\"path\":\"/var/log\"}");
+        else
+            snprintf(m, sizeof(m),
+                "不支持的 op：%s。sys 只认 shell / list / du / grep / read / write / "
+                "sysinfo / http_get / download。\n"
+                "抓网页请用 {\"op\":\"http_get\",\"url\":\"...\"}", op);
+        return jerr(m);
+    }
 }
 
 static plugin_desc_t desc = {
     PLUGIN_API_VERSION,
     "sys",
-    "sys 文件与系统：sysinfo=磁盘/内存/负载/温度/CPU shell=跑命令 list=列目录 du=占用 grep=搜索 read=读 write=写 http_get=抓网页 download=下载"
-    "搜索(grep) 读文件(read) 写文件(write) 系统信息(sysinfo) 抓网页(http_get) 下载(download)",
+    "sys 文件与系统（日志在 owrt 插件的 logread，不在这里）："
+    "sysinfo=磁盘/内存/负载/温度 shell=跑命令(可管道) list=列目录 du=占用 "
+    "grep=按关键字搜文件内容 read=读文件 write=写文件 http_get=抓网页(带状态码) download=下载",
     "{\"op\":\"shell\",\"cmd\":\"ls -la /tmp\"}"
     "  或 {\"op\":\"list\",\"path\":\"/tmp\"}"
     "  或 {\"op\":\"read\",\"path\":\"/tmp/a.txt\",\"lines\":200}"

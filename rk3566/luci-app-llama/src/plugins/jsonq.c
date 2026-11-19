@@ -45,11 +45,21 @@ static void jesc_into(const char *src, char *dst, size_t cap) {
 static int jget(const char *js, const char *key, char *out, size_t cap) {
     char pat[64];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(js, pat);
-    if (!p) return -1;
-    p = strchr(p + strlen(pat), ':');
-    if (!p) return -1;
-    p++;
+    /* 必须找到「后面紧跟冒号」的那个匹配。
+     * 直接 strstr 会踩坑：{"op":"query","file":"x","query":"..."} 里找 key
+     * "query"，第一个命中是 "op" 的【值】"query"，接着往后找冒号就摸到
+     * "file" 上去了 —— 于是 query 拿到的是文件路径，整个 jq 表达式全错。
+     * 遍历所有匹配，只认后面（允许空白）是 ':' 的那个。 */
+    const char *p = js;
+    const char *found = NULL;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *q = p + strlen(pat);
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == ':') { found = q; break; }
+        p = q;
+    }
+    if (!found) return -1;
+    p = found + 1;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     if (*p != '"') return -1;
     p++;

@@ -36,10 +36,18 @@ typedef struct {
 static int jget(const char *js, const char *key, char *out, size_t cap) {
     char pat[64];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(js, pat);
-    if (!p) return -1;
-    p = strchr(p + strlen(pat), ':');
-    if (!p) return -1;
+    /* 只认「后面紧跟冒号」的匹配：字段值恰好等于某个 key 名时会误命中
+     * （{"op":"query",...,"query":"x"} 找 query 会先撞上 op 的值），
+     * 那样解析出来的就是隔壁字段。 */
+    const char *p = js, *found = NULL;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *q = p + strlen(pat);
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == ':') { found = q; break; }
+        p = q;
+    }
+    if (!found) return -1;
+    p = found;
     p++;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     if (*p != '"') return -1;
@@ -1090,11 +1098,13 @@ static char *do_train(const char *task) {
     if (isnan(L)) L = num_before_unit(task, "米长的火车");
     if (isnan(L) || L <= 0) return NULL;
 
-    /* 速度：每秒 X 米 / 每小时 X 千米 */
-    double v = num_after_walk(task, "每秒");
+    /* 速度：优先"速度X米/秒"这种数字在后的写法。
+     * 原来的顺序是先找"每秒"，但"速度20米每秒"里"每秒"后面紧跟的是
+     * 下一句的数字（桥长），会把 800 当成速度。 */
+    double v = num_after_walk(task, "速度");
     int per_hour = 0;
+    if (isnan(v)) v = num_after_walk(task, "每秒");
     if (isnan(v)) { v = num_after_walk(task, "每小时"); if (!isnan(v)) per_hour = 1; }
-    if (isnan(v)) v = num_after_walk(task, "速度");
 
     /* 桥长 / 隧道长 */
     double bridge = num_before_unit(task, "米的桥");
@@ -1182,6 +1192,65 @@ static char *do_work(const char *task) {
     if (isnan(a) || isnan(b) || a <= 0 || b <= 0) return NULL;
     /* 只处理"合作完成全部"的场景；有分段/离开条件的交给别处 */
     if (!strstr(task, "合作") && !strstr(task, "一起") && !strstr(task, "合做")) return NULL;
+
+    /* ---- 分段：合作 C 天后某人离开，剩下的由另一个做完 ----
+     * 教科书经典题型："甲乙合作2天后甲离开，乙继续，共用多少天"。
+     * 以前这里把分段条件整个丢掉，只算"合作需要几天"，答案直接错：
+     *   10 天/15 天那道会答 6 天，正确是 2 + (1-2×(1/10+1/15))×15 = 12 天。 */
+    {
+        const char *lvkw = NULL;
+        static const char *LK[] = {"离开", "退出", "调走", "请假", "有事", "离去", NULL};
+        for (int i = 0; LK[i]; i++) {
+            const char *q = strstr(task, LK[i]);
+            if (q && (!lvkw || q < lvkw)) lvkw = q;
+        }
+        double c = num_after_walk(task, "合作");
+        if (isnan(c)) c = num_after_walk(task, "合做");
+        if (isnan(c)) c = num_after_walk(task, "一起");
+        if (lvkw && !isnan(c) && c > 0) {
+            const char *ja = NULL, *yi = NULL;
+            for (const char *p = task; (p = strstr(p, "甲")) != NULL; p += 3) ja = p;
+            for (const char *p = task; (p = strstr(p, "乙")) != NULL; p += 3) yi = p;
+            int left = -1;
+            if (ja && (!yi || (lvkw - ja) <= (lvkw - yi))) left = 0;   /* 甲走 */
+            else if (yi) left = 1;                                      /* 乙走 */
+            /* 题干常直接写"乙继续完成"，以它为准 */
+            if (strstr(task, "乙继续") || strstr(task, "乙单独完成")) left = 0;
+            else if (strstr(task, "甲继续") || strstr(task, "甲单独完成")) left = 1;
+
+            if (left >= 0) {
+                double done = c * (1.0 / a + 1.0 / b);
+                double rest = 1.0 - done;
+                if (rest < 0) rest = 0;
+                double solo = (left == 0) ? b : a;
+                double t2 = rest * solo;
+                double total = c + t2;
+                const char *who_l = left == 0 ? "甲" : "乙";
+                const char *who_s = left == 0 ? "乙" : "甲";
+                char text[1300], ans[160];
+                snprintf(text, sizeof(text),
+                    "**工程分段问题**（合作 %g 天后 %s 离开）\n\n"
+                    "| 步骤 | 计算 |\n|---|---|\n"
+                    "| 甲效率 | 1/%g |\n"
+                    "| 乙效率 | 1/%g |\n"
+                    "| 合作 %g 天做了 | %g × (1/%g + 1/%g) = %.4g |\n"
+                    "| 剩余工程量 | 1 − %.4g = %.4g |\n"
+                    "| %s单独做剩余 | %.4g × %g = %.4g 天 |\n"
+                    "| **总天数** | %g + %.4g = **%.4g 天** |\n\n"
+                    "**答案：共用 %.4g 天**（合作 %g 天 + %s单独 %.4g 天）",
+                    c, who_l,
+                    a, b,
+                    c, c, a, b, done,
+                    done, rest,
+                    who_s, rest, solo, t2,
+                    c, t2, total,
+                    total, c, who_s, t2);
+                snprintf(ans, sizeof(ans), "共用 %.4g 天（合作 %g 天 + %s单独 %.4g 天）",
+                         total, c, who_s, t2);
+                return json_pair(text, ans, NULL);
+            }
+        }
+    }
 
     double t = a * b / (a + b);
 

@@ -1,15 +1,18 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-llama
-PKG_VERSION:=2.0.0
+PKG_VERSION:=2.0.39
 PKG_RELEASE:=1
+# ⚠ luci.mk 会忽略 PKG_RELEASE（它按 VERSION:=$(PKG_VERSION) 打 ipk），
+#   所以每次改代码必须递增 PKG_VERSION 的最后一位（2.0.9 → 2.0.10 …），
+#   否则 opkg 认为版本没变，装完还是旧文件。
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=local
 
 LUCI_TITLE:=LuCI app for local llama.cpp inference
 LUCI_DESCRIPTION:=llama-server (GGUF, pure CPU) plus a login-free page at /llama.htm \
  with a C agent: 11 plugins (math / curl / jq / doc / sys / net / owrt / music / batch / table / sysmon)
-LUCI_DEPENDS:=+luci-base +libz +jq +curl +python3-light
+LUCI_DEPENDS:=+luci-base +zlib +jq-full +curl +python3-light
 
 # 包里带 aarch64 二进制（C agent），不能标 all
 LUCI_PKGARCH:=aarch64_cortex-a53

@@ -22,7 +22,10 @@
  *   iwinfo       [iface] [sub]       无线信息（sub=info/assoclist/scan）
  *   iw           sub [iface]         iw dev / iw list / station dump
  *   service      name action         status / reload / restart
- *   logread      [lines]             最近系统日志
+ *   logread      [lines] [key]       系统日志；key=只看含该关键字的行
+ *   passwd       user pass confirm:yes 改密码（必须用户确认；自动避开 bcrypt）
+ *   reboot       confirm:yes         重启（必须显式确认）
+ *   opkg_list    [pattern]           已装软件包清单
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +34,8 @@
 #include <unistd.h>
 #include <stdarg.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include "plugin.h"
 
@@ -40,10 +45,18 @@
 static int jget(const char *js, const char *key, char *out, size_t cap) {
     char pat[64];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(js, pat);
-    if (!p) return -1;
-    p = strchr(p + strlen(pat), ':');
-    if (!p) return -1;
+    /* 只认「后面紧跟冒号」的匹配：字段值恰好等于某个 key 名时会误命中
+     * （{"op":"query",...,"query":"x"} 找 query 会先撞上 op 的值），
+     * 那样解析出来的就是隔壁字段。 */
+    const char *p = js, *found = NULL;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *q = p + strlen(pat);
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == ':') { found = q; break; }
+        p = q;
+    }
+    if (!found) return -1;
+    p = found;
     p++;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     if (*p != '"') return -1;
@@ -192,6 +205,57 @@ static const char *risky_key(const char *key) {
 
 /* ---------------- op: uci show ---------------- */
 static char *op_uci_show(const char *pkg) {
+    /* 不带 package 时【不要】整库 dump：这台板上 uci show 有 600+ 项，
+     * 一次全吐出去会把上下文撑爆、回复直接被截断（实测就发生了）。
+     * 改成先返回包名清单，让调用方挑一个再查。 */
+    if (!pkg || !pkg[0]) {
+        /* 不要跑 `uci show` 全量：这台板 1181 行 ≈ 60KB，超过 OUTMAX(24KB)
+         * 会被截断并判成失败。直接列 /etc/config 下的文件名就是包名，
+         * 又快又准。 */
+        char names[96][40];
+        int n = 0;
+        DIR *d = opendir("/etc/config");
+        if (!d) return err_json("打不开 /etc/config");
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL && n < 96) {
+            const char *nm = de->d_name;
+            if (nm[0] == '.') continue;
+            if (strchr(nm, '.')) continue;          /* 跳过 .bak / .old / .rpcd */
+            if (strchr(nm, '~')) continue;
+            size_t L = strlen(nm);
+            if (L == 0 || L >= sizeof(names[0])) continue;
+            /* 确认真的是普通文件（有的目录也在这儿） */
+            char full[128];
+            snprintf(full, sizeof(full), "/etc/config/%s", nm);
+            struct stat st;
+            if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+            snprintf(names[n], sizeof(names[n]), "%s", nm);
+            n++;
+        }
+        closedir(d);
+        /* 简单排序，输出稳定 */
+        for (int a = 0; a < n; a++)
+            for (int b = a + 1; b < n; b++)
+                if (strcmp(names[b], names[a]) < 0) {
+                    char t[40];
+                    snprintf(t, sizeof(t), "%s", names[a]);
+                    snprintf(names[a], sizeof(names[a]), "%s", names[b]);
+                    snprintf(names[b], sizeof(names[b]), "%s", t);
+                }
+        char text[OUTMAX];
+        size_t i = (size_t)snprintf(text, sizeof(text),
+            "共 **%d 个配置包**。要查哪个就带 package，例如 "
+            "`{\"op\":\"uci_show\",\"package\":\"%s\"}`：\n\n",
+            n, n > 0 ? names[0] : "network");
+        for (int k = 0; k < n && i + 60 < sizeof(text); k++) {
+            i += (size_t)snprintf(text + i, sizeof(text) - i, "`%s`%s",
+                                  names[k], (k + 1) % 6 ? "　" : "\n");
+        }
+        char ans[128];
+        snprintf(ans, sizeof(ans), "共 %d 个配置包（未指定 package）", n);
+        return json_pair(text, ans, NULL);
+    }
+
     char out[OUTMAX];
     char *argv[4];
     argv[0] = (char *)"/sbin/uci";
@@ -213,6 +277,7 @@ static char *op_uci_show(const char *pkg) {
     char *save = NULL;
     for (char *line = strtok_r(out, "\n", &save); line && i < OUTMAX - 200;
          line = strtok_r(NULL, "\n", &save)) {
+        if (cnt >= 150) break;          /* 单包也可能很大，封个顶 */
         char *eq = strchr(line, '=');
         if (!eq) continue;
         *eq = 0;
@@ -491,6 +556,249 @@ static char *op_iw(const char *sub, const char *iface) {
 }
 
 /* ---------------- op: service ---------------- */
+/* ---------------- op: passwd ----------------
+ * 改用户密码。走 busybox 的 passwd，密码通过 stdin 喂进去。
+ *
+ * 为什么不用 chpasswd：OpenWrt 上它写出来的哈希 dropbear 和 rpcd 都不认
+ * （实测 shadow 里确实有 60 字节 SHA512，但 SSH 和 LuCI 全都登不进去），
+ * 是个能把人锁在门外的坑。
+ *
+ * 密码不进 argv（ps 里能看到），也不写进任何日志/返回值 —— 只报长度。
+ */
+/* 读 /etc/shadow 里某个用户的哈希前缀（$1$ / $2a$ / $6$ …），失败返回空 */
+static void shadow_prefix(const char *user, char *out, size_t cap) {
+    out[0] = 0;
+    FILE *f = fopen("/etc/shadow", "r");
+    if (!f) return;
+    char line[512];
+    size_t ul = strlen(user);
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, user, ul) != 0 || line[ul] != ':') continue;
+        char *p = line + ul + 1;
+        size_t i = 0;
+        while (*p && *p != ':' && i + 1 < cap) out[i++] = *p++;
+        out[i] = 0;
+        break;
+    }
+    fclose(f);
+}
+
+/* 纯 python 的 md5-crypt 兜底：这块板 musl 的 crypt() 返回 ENOSYS，
+ * 而 busybox passwd 会生成 bcrypt($2a$) —— dropbear 完全不认。
+ * 把脚本写到 /tmp 再跑，密码走管道，不进 argv。 */
+static int passwd_md5crypt(const char *user, const char *pass) {
+    static const char *PY =
+        "import hashlib,sys,os\n"
+        "S='./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'\n"
+        "def f(p,s):\n"
+        "    pw=p.encode();sl=s.encode()\n"
+        "    m=hashlib.md5();m.update(pw+b'$1$'+sl)\n"
+        "    x=hashlib.md5(pw+sl+pw).digest()\n"
+        "    for i in range(len(pw)):m.update(x[i%16:i%16+1])\n"
+        "    i=len(pw)\n"
+        "    while i:\n"
+        "        m.update(b'\\\\0' if i&1 else pw[:1]);i>>=1\n"
+        "    d=m.digest()\n"
+        "    for i in range(1000):\n"
+        "        m2=hashlib.md5()\n"
+        "        m2.update(pw if i&1 else d)\n"
+        "        if i%3:m2.update(sl)\n"
+        "        if i%7:m2.update(pw)\n"
+        "        m2.update(d if i&1 else pw)\n"
+        "        d=m2.digest()\n"
+        "    def t(v,n):\n"
+        "        o=''\n"
+        "        for _ in range(n):o+=S[v&0x3f];v>>=6\n"
+        "        return o\n"
+        "    o=''\n"
+        "    for a,b,c in ((0,6,12),(1,7,13),(2,8,14),(3,9,15),(4,10,5)):\n"
+        "        o+=t((d[a]<<16)|(d[b]<<8)|d[c],4)\n"
+        "    return '$1$'+s+'$'+o+t(d[11],2)\n"
+        "u=sys.argv[1];p=sys.stdin.readline().rstrip('\\\\n')\n"
+        "h=f(p,'ab12cd34')\n"
+        "L=open('/etc/shadow').read().splitlines()\n"
+        "O=[];done=False\n"
+        "for x in L:\n"
+        "    if x.startswith(u+':'):\n"
+        "        q=x.split(':');q[1]=h;O.append(':'.join(q));done=True\n"
+        "    else:O.append(x)\n"
+        "if not done:sys.stderr.write('no such user');sys.exit(3)\n"
+        "t=open('/etc/shadow.tmp','w');t.write('\\\\n'.join(O)+'\\\\n');t.close()\n"
+        "os.chmod('/etc/shadow.tmp',0o600)\n"
+        "os.rename('/etc/shadow.tmp','/etc/shadow')\n"
+        "print(h)\n";
+
+    const char *sp = "/tmp/.owrt_pw.py";
+    FILE *sf = fopen(sp, "w");
+    if (!sf) return -1;
+    fputs(PY, sf);
+    fclose(sf);
+
+    int fd[2];
+    if (pipe(fd) != 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(fd[0]); close(fd[1]); return -1; }
+    if (pid == 0) {
+        dup2(fd[0], STDIN_FILENO);
+        close(fd[0]);
+        close(fd[1]);
+        alarm(20);
+        execl("/usr/bin/python3", "python3", sp, user, (char *)NULL);
+        execl("/bin/python3", "python3", sp, user, (char *)NULL);
+        _exit(127);
+    }
+    close(fd[0]);
+    char buf[200];
+    int n = snprintf(buf, sizeof(buf), "%s\n", pass);
+    if (n > 0) { ssize_t w = write(fd[1], buf, (size_t)n); (void)w; }
+    close(fd[1]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* ---------------- op: passwd ----------------
+ * 改某个用户的密码。
+ *
+ * 两道闸：
+ *   1. 必须 confirm:"yes" —— 但这个值由【页面弹窗用户确认后】才补上，
+ *      模型自己填不算数（前端检测不到确认就不会补）。
+ *   2. 生成哈希后要检查格式：这块板的 dropbear 只认 $1$/$5$/$6$，
+ *      busybox passwd 却会生成 bcrypt($2a$)，设完照样登不进去。
+ *      发现不是支持的格式就自动用纯 python md5-crypt 重写。
+ *
+ * 密码不写 argv、不进日志（只报长度）。
+ */
+static char *op_passwd(const char *user, const char *pass, const char *confirm) {
+    const char *u = (user && user[0]) ? user : "root";
+    if (!confirm || strcmp(confirm, "yes"))
+        return err_json("改密码是高危操作：必须由用户在页面上确认后传 confirm:\"yes\"。"
+                        "没人确认过就拒绝执行");
+    if (!safe_token(u, 32, 0)) return err_json("用户名不合法：%s", u);
+    if (!pass || !pass[0]) return err_json("需要 pass（新密码）");
+    if (strlen(pass) > 128) return err_json("密码太长（上限 128 字节）");
+
+    /* 第一步：走系统自带的 passwd */
+    int code = -1;
+    int fd[2];
+    if (pipe(fd) == 0) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            dup2(fd[0], STDIN_FILENO);
+            close(fd[0]);
+            close(fd[1]);
+            alarm(15);
+            execl("/bin/passwd", "passwd", u, (char *)NULL);
+            execl("/usr/bin/passwd", "passwd", u, (char *)NULL);
+            _exit(127);
+        }
+        if (pid > 0) {
+            close(fd[0]);
+            char buf[320];
+            int n = snprintf(buf, sizeof(buf), "%s\n%s\n", pass, pass);
+            if (n > 0 && n < (int)sizeof(buf)) {
+                size_t off = 0;
+                while (off < (size_t)n) {
+                    ssize_t w = write(fd[1], buf + off, (size_t)n - off);
+                    if (w <= 0) break;
+                    off += (size_t)w;
+                }
+            }
+            close(fd[1]);
+            int st = 0;
+            waitpid(pid, &st, 0);
+            code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        } else {
+            close(fd[0]);
+            close(fd[1]);
+        }
+    }
+
+    /* 第二步：查生成的哈希格式，dropbear 不认的自动换成 md5-crypt */
+    char pref[16] = {0};
+    shadow_prefix(u, pref, sizeof(pref));
+    int fallback = 0;
+    if (!pref[0] || (!strncmp(pref, "$2a$", 4) || !strncmp(pref, "$2b$", 4)
+                     || !strncmp(pref, "$2y$", 4) || pref[0] != '$')) {
+        /* bcrypt 或不认识 → 换 md5-crypt */
+        int rc2 = passwd_md5crypt(u, pass);
+        if (rc2 != 0)
+            return err_json("passwd 返回 %d，md5-crypt 兜底也失败（退出码 %d）", code, rc2);
+        fallback = 1;
+        shadow_prefix(u, pref, sizeof(pref));
+    }
+
+    if (code != 0 && !fallback)
+        return err_json("passwd 失败（退出码 %d）", code);
+    if (!pref[0] || !strncmp(pref, "$2", 2))
+        return err_json("密码写进去了但哈希格式不受支持（%s），dropbear 会登不进去", pref);
+
+    char text[600], ans[200];
+    snprintf(text, sizeof(text),
+             "已设置用户 **%s** 的密码（%d 字节）。\n\n"
+             "哈希格式：`%s`（dropbear 认这个）%s\n\n"
+             "SSH 和 LuCI 立刻生效。旧会话不受影响，新连接用新密码。",
+             u, (int)strlen(pass), pref,
+             fallback ? "\n\n> 系统 passwd 生成的是 bcrypt，dropbear 不认，已自动改用 md5-crypt。" : "");
+    snprintf(ans, sizeof(ans), "%s 的密码已更新（%s）", u, pref);
+    return json_pair(text, ans, NULL);
+}
+
+/* ---------------- op: reboot ----------------
+ * 重启。必须显式 confirm:"yes" —— 这个动作会断开所有连接，
+ * 不设这道门槛的话模型很容易顺手调一下。
+ */
+static char *op_reboot(const char *confirm) {
+    if (!confirm || strcmp(confirm, "yes"))
+        return err_json("重启必须显式传 confirm:\"yes\"（会断开所有连接，约 30-60 秒恢复）");
+    sync();
+    /* 延迟 2 秒，让这次的 HTTP 响应先发出去 */
+    pid_t pid = fork();
+    if (pid == 0) {
+        sleep(2);
+        execl("/sbin/reboot", "reboot", (char *)NULL);
+        execl("/bin/reboot", "reboot", (char *)NULL);
+        _exit(0);
+    }
+    char text[300];
+    snprintf(text, sizeof(text),
+             "设备将在 2 秒后重启。\n\n"
+             "所有连接会断开，大约 30-60 秒后恢复。\n\n"
+             "重启后 llama-server 和 agent 由 init.d 自动拉起。");
+    return json_pair(text, "已安排重启（2 秒后）", NULL);
+}
+
+/* ---------------- op: opkg_list ----------------
+ * 已安装软件包清单，可按名字过滤（只读）。
+ */
+static char *op_opkg_list(const char *pattern) {
+    char out[OUTMAX];
+    char *argv[] = { (char *)"/bin/opkg", (char *)"list-installed", NULL };
+    int rc = run_argv(argv, out, sizeof(out));
+    if (rc != 0) return err_json("opkg list-installed 失败（退出码 %d）", rc);
+
+    /* 按 pattern 过滤 + 转成表格 */
+    char text[OUTMAX];
+    size_t ti = 0;
+    int cnt = 0;
+    ti += snprintf(text + ti, sizeof(text) - ti, "| 软件包 | 版本 |\n|---|---|\n");
+    char *save = NULL;
+    for (char *line = strtok_r(out, "\n", &save); line && ti + 200 < sizeof(text);
+         line = strtok_r(NULL, "\n", &save)) {
+        if (pattern && pattern[0] && !strstr(line, pattern)) continue;
+        char *sp = strchr(line, ' ');
+        if (!sp) continue;
+        *sp = 0;
+        if (++cnt > 80) continue;
+        ti += snprintf(text + ti, sizeof(text) - ti, "| `%s` | %s |\n", line, sp + 1);
+    }
+    if (cnt == 0) return err_json("没有匹配的软件包（共扫描完 opkg 列表）");
+    char ans[200];
+    snprintf(ans, sizeof(ans), "已装 %d 个包%s", cnt,
+             (pattern && pattern[0]) ? "（已过滤）" : "");
+    return json_pair(text, ans, NULL);
+}
+
 static char *op_service(const char *name, const char *action) {
     if (!safe_token(name, 48, 0)) return err_json("服务名不合法：%s", name);
     const char *a = (action && action[0]) ? action : "status";
@@ -516,7 +824,24 @@ static char *op_service(const char *name, const char *action) {
 }
 
 /* ---------------- op: logread ---------------- */
-static char *op_logread(int lines) {
+/* 不区分大小写的子串查找（musl 的 strcasestr 不可靠，自己写） */
+static int has_ci(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    if (!nl) return 1;
+    for (const char *p = hay; *p; p++) {
+        size_t k = 0;
+        while (k < nl && p[k]
+               && tolower((unsigned char)p[k]) == tolower((unsigned char)needle[k]))
+            k++;
+        if (k == nl) return 1;
+    }
+    return 0;
+}
+
+/* 读系统日志。
+ * pattern 非空时只保留包含它的行 —— "日志里的 404" 这类需求必须先过滤，
+ * 否则只能盲吐最近 N 行，用户要的东西淹没在里面。 */
+static char *op_logread(int lines, const char *pattern) {
     if (lines <= 0) lines = 30;
     if (lines > 300) lines = 300;
     char out[OUTMAX];
@@ -524,30 +849,54 @@ static char *op_logread(int lines) {
     int rc = run_argv(argv, out, sizeof(out));
     if (rc != 0 || !out[0]) return err_json("logread 失败");
 
-    /* 只留最后 N 行 */
-    char *save = NULL;
-    char *keep[300];
+    int total = 0;
     int n = 0;
-    for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+    char *keep[300];
+    char *save = NULL;
+    for (char *line = strtok_r(out, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        total++;
+        if (pattern && pattern[0] && !has_ci(line, pattern)) continue;
         keep[n % 300] = line;
         n++;
     }
+
     int show = n < lines ? n : lines;
     char text[OUTMAX];
-    size_t i = (size_t)snprintf(text, sizeof(text), "最近 %d 行日志：\n\n```\n", show);
-    for (int k = n - show; k < n && i < OUTMAX - 300; k++)
+    size_t i;
+    if (pattern && pattern[0]) {
+        if (n == 0) {
+            snprintf(text, sizeof(text),
+                     "日志里没有含 **%s** 的记录（共扫了 %d 行）。\n\n"
+                     "可以换个关键字，或者不带关键字看最近几行。", pattern, total);
+            char a[160];
+            snprintf(a, sizeof(a), "没找到含 %s 的日志（共 %d 行）", pattern, total);
+            return json_pair(text, a, NULL);
+        }
+        i = (size_t)snprintf(text, sizeof(text),
+                             "日志里含 **%s** 的记录：共 %d 行（总 %d 行），显示最近 %d 行\n\n```\n",
+                             pattern, n, total, show);
+    } else {
+        i = (size_t)snprintf(text, sizeof(text), "最近 %d 行日志（总共 %d 行）：\n\n```\n",
+                             show, total);
+    }
+    for (int k = n - show; k < n && i < OUTMAX - 400; k++)
         i += (size_t)snprintf(text + i, OUTMAX - i, "%s\n", keep[k % 300]);
     snprintf(text + i, OUTMAX - i, "```");
-    char ans[96];
-    snprintf(ans, sizeof(ans), "最近 %d 行系统日志", show);
+
+    char ans[200];
+    if (pattern && pattern[0])
+        snprintf(ans, sizeof(ans), "含 %s 的日志 %d 行（总 %d 行）", pattern, n, total);
+    else
+        snprintf(ans, sizeof(ans), "最近 %d 行日志（总 %d 行）", show, total);
     return json_pair(text, ans, NULL);
 }
 
-/* ---------------- 入口 ---------------- */
 static char *run(const char *json_in) {
     char op[32] = {0}, key[160] = {0}, value[600] = {0};
     char pkg[80] = {0}, iface[40] = {0}, sub[32] = {0};
     char reload[64] = {0}, name[64] = {0}, action[32] = {0};
+    char user[40] = {0}, pass[160] = {0}, confirm[16] = {0};
 
     jget(json_in, "op", op, sizeof(op));
     jget(json_in, "key", key, sizeof(key));
@@ -558,6 +907,9 @@ static char *run(const char *json_in) {
     jget(json_in, "reload", reload, sizeof(reload));
     jget(json_in, "name", name, sizeof(name));
     jget(json_in, "action", action, sizeof(action));
+    jget(json_in, "user", user, sizeof(user));
+    jget(json_in, "pass", pass, sizeof(pass));
+    jget(json_in, "confirm", confirm, sizeof(confirm));
 
     if (!op[0]) {
         /* 模型常把子命令当工具名写（{"tool":"uci_show"}），
@@ -601,17 +953,35 @@ static char *run(const char *json_in) {
     if (!strcmp(op, "service") || !strcmp(op, "initd"))
         return op_service(name[0] ? name : (pkg[0] ? pkg : ""), action);
     if (!strcmp(op, "logread") || !strcmp(op, "log"))
-        return op_logread(jget_int(json_in, "lines", 30));
+        return op_logread(jget_int(json_in, "lines", 30), key);
+    if (!strcmp(op, "passwd"))
+        return op_passwd(user, pass, confirm);
+    if (!strcmp(op, "reboot"))
+        return op_reboot(confirm);
+    if (!strcmp(op, "opkg_list") || !strcmp(op, "packages"))
+        return op_opkg_list(key[0] ? key : NULL);
+
+    /* 常见误用：把别的插件的 op 丢给 owrt。直接说清该去哪，别让模型瞎试。 */
+    if (!strcmp(op, "grep") || !strcmp(op, "find") || !strcmp(op, "ls")
+        || !strcmp(op, "cat") || !strcmp(op, "read") || !strcmp(op, "du"))
+        return err_json("op `%s` 不属于 owrt 插件，它是 sys 插件的。"
+                        "改用 {\"op\":\"%s\", ...}（不要指定 plugin=owrt，框架会自动路由到 sys）",
+                        op, op);
+    if (!strcmp(op, "calc") || !strcmp(op, "solve"))
+        return err_json("op `%s` 属于 math 插件，不是 owrt。", op);
+    if (!strcmp(op, "probe") || !strcmp(op, "login"))
+        return err_json("op `%s` 属于 browser 插件，不是 owrt。", op);
 
     return err_json("不支持的 op：%s（uci_show/get/set/add_list/del_list/delete/commit/revert, "
-                    "iwinfo, iw, service, logread）", op);
+                    "iwinfo, iw, service, logread, passwd, reboot, opkg_list）", op);
 }
 
 static plugin_desc_t desc = {
     PLUGIN_API_VERSION,
     "owrt",
     "OpenWrt 配置：uci 查询/修改/提交(uci_*) 无线信息(iwinfo) 无线诊断(iw) "
-    "服务控制(service) 系统日志(logread)。改配置分两步，commit 才生效",
+    "服务控制(service) 系统日志(logread) 改密码(passwd) 重启(reboot) "
+    "已装包列表(opkg_list)。改配置分两步，commit 才生效；reboot 必须 confirm:yes",
     "{\"op\":\"uci_show\",\"package\":\"network\"}"
     "  或 {\"op\":\"uci_get\",\"key\":\"network.lan.ipaddr\"}"
     "  或 {\"op\":\"uci_set\",\"key\":\"network.lan.ipaddr\",\"value\":\"192.168.1.1\"}"

@@ -15,7 +15,7 @@ CFLAGS  := -O2 -Wall -Wextra -fPIC -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
 LDFLAGS ?= -ldl
 
 # 插件列表：新增插件只要往这里加一行
-PLUGINS := math table batch doc net sysmon owrt sys music curl jsonq
+PLUGINS := math table batch doc net sysmon owrt sys music curl jsonq browser
 
 all: agent cgi $(PLUGINS:%=plugins/%.so)
 
@@ -37,12 +37,16 @@ agent: agent.c json.c memcheck.c plugin.h json.h
 
 # py_write.h 是 doc.c 内嵌的 python 脚本，改了它必须重编 doc.so
 plugins/doc.so: py_write.h plugins/doc_read.inc
+plugins/browser.so: py_browse.h
 # curl_table.inc 是 curl.c include 进来的，改了它必须重编 curl.so
 plugins/jsonq.so: plugins/json_table.inc
 plugins/%.so: plugins/%.c plugin.h
 	$(CC) $(CFLAGS) -I. -shared -o $@ $< -lz $(LDFLAGS)
 	@mkdir -p plugins
 
+# 安装清单是【白名单】：逐条 install 具体产物，不用 cp -r。
+# 所以 src/tests/ 里的开发期测试脚本不会进 ipk（已核对：46 个文件，零 .py）。
+# 以后加产物也请逐条写，别图省事改成 cp -r src/* —— 那会把测试脚本一起打进去。
 install: all
 	install -d $(DESTDIR)/opt/llama/agent/plugins
 	install -d $(DESTDIR)/www/cgi-bin

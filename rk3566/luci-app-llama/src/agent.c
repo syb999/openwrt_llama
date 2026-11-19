@@ -35,6 +35,11 @@
 
 static plugin_desc_t *g_plug[MAX_PLUGINS];
 static int g_n = 0;
+/* 插件启停：名单落在 /etc/llama.plugoff，加载时跳过被停用的插件。
+ * 放在文件最前面是因为 env_json 也要读（它比 load_plugins 早）。 */
+static char g_plugoff[512] = {0};
+static char g_disabled[32][32];
+static int  g_ndis = 0;
 
 /* 自动化实例的运行状态落盘在这：/tmp/agent-auto/<name>.pid
  * 页面靠它判断"在跑 / 没跑"，停止也靠它找 pid。
@@ -112,10 +117,18 @@ static const char *skip_ws(const char *p) {
 static int flat_get(const char *js, const char *key, char *out, size_t cap) {
     char pat[128];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(js, pat);
-    if (!p) return -1;
-    p = strchr(p + strlen(pat), ':');
-    if (!p) return -1;
+    /* 只认「后面紧跟冒号」的匹配：字段值恰好等于某个 key 名时会误命中
+     * （{"op":"query",...,"query":"x"} 找 query 会先撞上 op 的值），
+     * 那样解析出来的就是隔壁字段。 */
+    const char *p = js, *found = NULL;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *q = p + strlen(pat);
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == ':') { found = q; break; }
+        p = q;
+    }
+    if (!found) return -1;
+    p = found;
     p = skip_ws(p + 1);
     if (*p != '"') return -1;
     p++;
@@ -652,19 +665,20 @@ static void env_json(char *out, size_t cap) {
     int py     = bits[0] == '1';
     int f_sympy = bits[3] == '1', f_midi = bits[4] == '1', f_pypdf = bits[5] == '1';
     int f_docx  = bits[6] == '1', f_xlsx = bits[7] == '1', f_pptx  = bits[8] == '1';
-    /* jq / curl 是外部命令：有没有直接看可执行文件在不在 */
-    int f_jq   = access("/usr/bin/jq", X_OK) == 0;
-    int f_curl = access("/usr/bin/curl", X_OK) == 0;
+    /* jq / curl / ppocr 是外部命令：有没有直接看可执行文件在不在 */
+    int f_jq    = access("/usr/bin/jq", X_OK) == 0;
+    int f_curl  = access("/usr/bin/curl", X_OK) == 0;
+    int f_ppocr = access("/usr/bin/ppocr", X_OK) == 0;
 
     /* 分两组：runtimes = 底层运行时（谁都得有），libs = 专用库（特定插件才用） */
     size_t off = (size_t)snprintf(out, cap,
         "{\"runtimes\":{\"python3\":%d,\"node\":%d,\"ffmpeg\":%d},"
-        "\"libs\":{\"jq\":%d,\"curl\":%d,\"sympy\":%d,\"midiutil\":%d,\"pypdf\":%d,\"docx\":%d,"
+        "\"libs\":{\"jq\":%d,\"curl\":%d,\"ppocr\":%d,\"sympy\":%d,\"midiutil\":%d,\"pypdf\":%d,\"docx\":%d,"
         "\"openpyxl\":%d,\"pptx\":%d},\"plugins\":[",
         /* 顺序必须跟格式串一致：runtimes 三个（python3/node/ffmpeg），
-         * 然后 libs 八个（jq/curl/sympy/midiutil/pypdf/docx/openpyxl/pptx） */
+         * 然后 libs 九个（jq/curl/ppocr/sympy/midiutil/pypdf/docx/openpyxl/pptx） */
         py, bits[1] == '1', bits[2] == '1',
-        f_jq, f_curl,
+        f_jq, f_curl, f_ppocr,
         f_sympy, f_midi, f_pypdf, f_docx, f_xlsx, f_pptx);
     for (int i = 0; i < g_n && off < cap - 620; i++) {
         /* desc 必须转义：插件描述里出现 " 或 \ （比如 curl 的 "\uXXXX"）
@@ -689,6 +703,13 @@ static void env_json(char *out, size_t cap) {
             (g_n + i) ? "," : "", ne, de, te,
             running ? 1 : 0, running ? (int)apid : 0);
     }
+    /* 被停用的插件也要报出来，否则页面上看不到它们、没法重新打开 */
+    off += (size_t)snprintf(out + off, cap - off, "],\"disabled\":[");
+    for (int i = 0; i < g_ndis && off < cap - 80; i++) {
+        char de[64];
+        json_escape(g_disabled[i], de, sizeof(de));
+        off += (size_t)snprintf(out + off, cap - off, "%s\"%s\"", i ? "," : "", de);
+    }
     snprintf(out + off, cap - off, "]}");
 }
 
@@ -705,6 +726,7 @@ typedef struct {
 static const plug_dep_t PLUG_DEPS[] = {
     {"curl", "/usr/bin/curl", "curl"},
     {"jq",   "/usr/bin/jq",   "jq"},
+    {"browser", "/opt/chrome-root/cdrv.sh", "chromedriver"},
     {NULL, NULL, NULL}
 };
 
@@ -752,6 +774,49 @@ static int cmp_plug(const void *a, const void *b) {
     return strcmp(x->name, y->name);
 }
 
+/* ============ 插件启停 ============
+ * 插件一多，prompt 里的工具表就长，3B 选错率上升、每步都慢。
+ * 允许在页面上关掉不用的插件：名单落在 /etc/llama.plugoff（一行一个名字），
+ * 加载时直接不 dlopen，连内存都省了。
+ * 被关掉的插件仍然会出现在环境面板里（标 disabled），方便重新打开。 */
+
+static void read_plugoff(void) {
+    FILE *f = fopen("/etc/llama.plugoff", "r");
+    if (!f) return;
+    char line[64];
+    size_t off = 0;
+    while (fgets(line, sizeof(line), f) && off + 64 < sizeof(g_plugoff)) {
+        /* 一行一个，顺手转成逗号分隔 */
+        size_t L = strcspn(line, "\r\n");
+        if (L == 0) continue;
+        line[L] = 0;
+        off += (size_t)snprintf(g_plugoff + off, sizeof(g_plugoff) - off,
+                                "%s%s", off ? "," : "", line);
+    }
+    fclose(f);
+}
+
+/* 名字是否在停用名单里（逗号分隔精确匹配） */
+static int plugin_disabled(const char *name) {
+    if (!g_plugoff[0] || !name || !name[0]) return 0;
+    size_t nl = strlen(name);
+    const char *p = g_plugoff;
+    while (*p) {
+        const char *c = strchr(p, ',');
+        size_t n = c ? (size_t)(c - p) : strlen(p);
+        if (n == nl && !strncmp(p, name, n)) return 1;
+        if (!c) break;
+        p = c + 1;
+    }
+    return 0;
+}
+
+static void mark_disabled(const char *name) {
+    if (!name || g_ndis >= MAX_PLUGINS) return;
+    snprintf(g_disabled[g_ndis], sizeof(g_disabled[0]), "%s", name);
+    g_ndis++;
+}
+
 static void load_plugins(const char *dir) {
     DIR *d = opendir(dir);
     if (!d) {
@@ -783,6 +848,10 @@ static void load_plugins(const char *dir) {
                 fprintf(stderr, "跳过 %s: 缺 %s（这个插件靠它干活）\n",
                         p->name, plugin_missing_dep(p->name));
                 loaded = -1;                 /* 标记"因缺依赖跳过"，后面别再注册 */
+            } else if (plugin_disabled(p->name)) {
+                fprintf(stderr, "跳过 %s: 页面上停用了\n", p->name);
+                mark_disabled(p->name);
+                loaded = -1;
             } else if (find_plugin(p->name)) {
                 fprintf(stderr, "跳过 %s: 工具名重复(%s)\n", e->d_name, p->name);
             } else if (g_n < MAX_PLUGINS) {
@@ -873,6 +942,12 @@ static int is_pure_chat(const char *task) {
 /* 框架已经自己跑过 curl（用户粘了命令）→ 数据就在上下文里，
  * 不需要再列别的插件让模型去"取数据"。 */
 static int g_prefetched = 0;
+/* tools_prompt 判定这个任务是纯对话（不需要任何工具）时置 1。
+ * 主循环据此换一套 system prompt —— 带 op 归属表和少样本的那套会被
+ * 小模型当成"必须调工具"的证据，问"解释一下 NPU"它真会去调 jq。 */
+static int g_pure_chat_task = 0;
+/* 框架直连登录失败时的诊断，会注入给模型判断 */
+static char g_login_diag[1600] = {0};
 
 typedef struct {
     const char *plugin;
@@ -893,14 +968,150 @@ static const route_t ROUTES[] = {
     {"doc",   "pdf|PDF|word|Word|excel|Excel|ppt|PPT|文档|xlsx|docx|pptx|"
               "导出|生成.*报告|做个.*表|幻灯片|演示"},
     {"music", "音乐|midi|MIDI|旋律|作曲|编曲|mp3|MP3|节奏|伴奏|曲子|歌曲|音色"},
+    {"browser", "需要登录|登录后|cookie|session|鉴权|自动化浏览器|selenium"},
     {"table", "排序|排行|top|TOP|筛选|名次|前.*名"},
     {"batch", "分批|大量|很多(页|章|节)|长文档|多章节|整套"},
     {"sysmon","监控|巡检|告警|阈值|采样"},
 };
 
 /* 返回选中插件的下标数组，返回个数；0 = 没命中（调用方应该全列） */
+/* ---------- 插件命令直连 ----------
+ * 用户直接把插件命令贴进来（形如 {"op":"probe","url":"..."}）时，别丢给
+ * 模型猜：3B 模型不认识这种输入，会当普通文本乱答（实测 {"op":"probe",...}
+ * 被答成 "Goofish / [统计] 12 个插件 / C 框架"）。这里查表找到插件直接执行，
+ * 结果原样返回 —— 跟登录场景的"框架直连"是同一个思路。
+ */
+static int json_str_field(const char *js, const char *key, char *out, size_t cap) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    /* 只认「后面紧跟冒号」的匹配：字段值恰好等于某个 key 名时会误命中
+     * （{"op":"query",...,"query":"x"} 找 query 会先撞上 op 的值），
+     * 那样解析出来的就是隔壁字段。 */
+    const char *p = js, *found = NULL;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *q = p + strlen(pat);
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == ':') { found = q; break; }
+        p = q;
+    }
+    if (!found) return -1;
+    p = found;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '"') return -1;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i + 1 < cap) {
+        if (*p == '\\' && p[1]) p++;
+        out[i++] = *p++;
+    }
+    out[i] = 0;
+    return 0;
+}
+
+static const char *op_to_plugin(const char *js, const char *op) {
+    /* 显式指定优先：{"plugin":"jq","op":"probe","path":"..."} */
+    static char pe[32];        /* static：这个指针要返回出去，不能放栈上 */
+    pe[0] = 0;
+    if (json_str_field(js, "plugin", pe, sizeof(pe)) == 0 && pe[0]) return pe;
+
+    const int has_url  = strstr(js, "\"url\"")  != NULL;
+    const int has_path = strstr(js, "\"path\"") != NULL || strstr(js, "\"file\"") != NULL;
+
+    /* read / write 有歧义：Office/PDF 走 doc，纯文本走 sys。
+     * 注意别把 .txt/.md/.csv 算给 doc —— doc 没有 write 这个 op（它只认
+     * text/docx/xlsx/pptx/pdf），路由过去会掉进读逻辑报"读不出内容"。
+     * sys 自己就能读写纯文本。 */
+    if (!strcmp(op, "read") || !strcmp(op, "write")) {
+        static const char *EXT[] = {".pdf", ".docx", ".xlsx", ".pptx",
+                                    ".doc", ".xls", ".ppt", NULL};
+        for (int i = 0; EXT[i]; i++)
+            if (strstr(js, EXT[i])) return "doc";
+        return "sys";
+    }
+    /* probe 也有歧义：带 url 是 browser 探测页面，带 path 是 jq 探测 JSON */
+    if (!strcmp(op, "probe")) return (has_path && !has_url) ? "jq" : "browser";
+    /* plan 也有歧义：带 chunks 是 batch 的分片规划，否则是 math 的计划类应用题 */
+    if (!strcmp(op, "plan")) return strstr(js, "\"chunks\"") ? "batch" : "math";
+
+    static const struct { const char *op, *plug; } M[] = {
+        {"autologin","browser"}, {"login","browser"}, {"hunt","browser"},
+        {"drag","browser"}, {"captcha","browser"}, {"cookie","browser"},
+        {"shot","browser"},
+        {"ping","net"}, {"port","net"}, {"resolve","net"}, {"route","net"},
+        {"arp","net"}, {"link","net"}, {"wifi","net"}, {"trace","net"},
+        {"hostname","net"}, {"stat","net"},
+        {"calc","math"}, {"solve","math"}, {"system","math"}, {"num","math"},
+        {"meet","math"}, {"ring","math"}, {"train","math"}, {"work","math"},
+        {"chicken","math"}, {"plan","math"},
+        {"get","jq"}, {"query","jq"}, {"table","jq"}, {"keys","jq"},
+        {"csv","jq"}, {"extract","jq"}, {"page","jq"},
+        {"sort","table"},        /* table 插件的排序；jq 的 table 是导出 CSV，不冲突 */
+        /* doc 的写操作：源码 is_write_op() 认这几个，不是 "write" */
+        {"docx","doc"}, {"xlsx","doc"}, {"pptx","doc"}, {"pdf","doc"},
+        {"text","doc"}, {"docx_append","doc"}, {"xlsx_edit","doc"},
+        {"xlsx_read","doc"},
+        {"sysinfo","sys"}, {"shell","sys"}, {"list","sys"}, {"du","sys"},
+        {"grep","sys"}, {"http_get","sys"}, {"download","sys"},
+        {"uci_get","owrt"}, {"uci_set","owrt"}, {"uci_commit","owrt"},
+        {"uci_show","owrt"}, {"uci_changes","owrt"}, {"uci_delete","owrt"},
+        {"uci_add_list","owrt"}, {"uci_del_list","owrt"}, {"uci_revert","owrt"},
+        {"iwinfo","owrt"}, {"iw","owrt"}, {"service","owrt"}, {"logread","owrt"},
+        {"passwd","owrt"}, {"reboot","owrt"}, {"opkg_list","owrt"},
+        {"midi","music"}, {"render","music"}, {"import","music"}, {"wav","music"},
+        {"parse","curl"},        /* curl 插件的 op 名是 parse（吃 cURL 原文） */
+        {"snapshot","sysmon"},
+        {"start","sysmon-auto"}, {"stop","sysmon-auto"}, {"status","sysmon-auto"},
+        {NULL, NULL}
+    };
+    for (int i = 0; M[i].op; i++)
+        if (!strcmp(M[i].op, op)) return M[i].plug;
+    return NULL;
+}
+
+/* 认出是插件命令就直接执行，返回 1（结果已打到 stdout） */
+static int try_direct_plugin(const char *task) {
+    if (!task || task[0] != '{') return 0;
+    char op[48] = {0};
+    if (json_str_field(task, "op", op, sizeof(op)) != 0 || !op[0]) return 0;
+    const char *pw = op_to_plugin(task, op);
+    if (!pw) return 0;
+    plugin_desc_t *pl = find_plugin(pw);
+    if (!pl) return 0;
+    char *res = pl->run(task);
+    if (res) {
+        printf("%s\n", res);
+        free(res);
+    }
+    return 1;
+}
+
 static int route_plugins(const char *task, int *idx, int maxn) {
+    /* 任务里带网址、并且是要"抓/看/访问页面" → 只给 sys(能 http_get) 和
+     * browser(能真正打开页面)。否则模型会去挑 curl，而 curl 要的是浏览器
+     * 复制的整段命令，不是网址，一调就报"缺少 url"，白烧步数。 */
+    if (maxn > 0 && task && (strstr(task, "http://") || strstr(task, "https://"))
+        && (strstr(task, "抓取") || strstr(task, "爬取") || strstr(task, "抓")
+            || strstr(task, "访问") || strstr(task, "打开") || strstr(task, "页面")
+            || strstr(task, "网页") || strstr(task, "404") || strstr(task, "状态码"))) {
+        int n = 0;
+        for (int i = 0; i < g_n && n < maxn; i++)
+            if (!strcmp(g_plug[i]->name, "sys") || !strcmp(g_plug[i]->name, "browser")
+                || !strcmp(g_plug[i]->name, "curl"))
+                idx[n++] = i;
+        if (n > 0) return n;
+    }
     /* 文档扩展名 → 只给 doc，不给别的选择 */
+    /* 提到登录/验证码/抓请求头 → 只给 browser。curl 只能发请求，处理不了登录框，
+     * 也拿不到 JS 现算的签名头（那得让浏览器自己跑一遍）。 */
+    if (maxn > 0 && task && (strstr(task, "登录") || strstr(task, "登陆")
+                             || strstr(task, "验证码") || strstr(task, "扫码")
+                             || strstr(task, "请求头") || strstr(task, "抓包")
+                             || strstr(task, "接口签名") || strstr(task, "签名参数")
+                             || strstr(task, "login") || strstr(task, "signin"))) {
+        for (int i = 0; i < g_n; i++)
+            if (!strcmp(g_plug[i]->name, "browser")) { idx[0] = i; return 1; }
+    }
     if (maxn > 0 && task && (strstr(task, ".xlsx") || strstr(task, ".xlsm")
                  || strstr(task, ".docx") || strstr(task, ".pptx")
                  || strstr(task, ".pdf"))) {
@@ -933,9 +1144,19 @@ static char *tools_prompt(const char *task) {
     if (!s) return NULL;
     size_t off = 0;
 
+    /* 框架刚刚自己试过登录但没成 —— 把原因告诉模型，让它判断该建议什么，
+     * 而不是让它一头雾水地重试一遍 */
+    if (g_login_diag[0]) {
+        off += (size_t)snprintf(s + off, SMALL - off,
+            "【重要背景】框架刚替你尝试过自动登录，结果失败了：\n%s\n"
+            "请判断原因，给用户明确结论和建议。不要自己反复重试登录"
+            "（验证码认得出来早成功了）。\n\n", g_login_diag);
+    }
+
     int idx[8];
     int nsel = 0;
 
+    g_pure_chat_task = 0;
     /* 纯对话：路由一个都没命中，也没有强动作词 → 不给插件表。
      * 顺序很重要：先跑路由（math 的关键词里有"算"，"帮我算一下"能命中），
      * 命中就说明要动手，别当纯对话。 */
@@ -946,6 +1167,7 @@ static char *tools_prompt(const char *task) {
                 "这个问题不需要任何工具，直接回答。\n"
                 "格式：{\"tool\":\"final\",\"answer\":\"你的回答\"}\n"
                 "回答用中文，条理清楚，别超过 200 字。\n");
+            g_pure_chat_task = 1;
             if (getenv("AGENT_DEBUG")) fprintf(stderr, "  [路由] 纯对话，不带插件\n");
             return s;
         }
@@ -1168,6 +1390,110 @@ static int run_task_chunks(const char *task) {
     return ran;
 }
 
+
+/* ============ 登录流程直连 ============
+ * 任务形如："账号=xxx 密码=yyy 登录 https://x.com/login"
+ * 3B 组不出 {"op":"probe",...} 这种参数（实测两次传空 url），
+ * 而登录本身是确定性流程：开页面 → 填账号密码 → 点登录 → 拿 cookie。
+ * 框架自己做，几秒钟出结果。 */
+
+/* 从任务里抠出账号和密码 */
+static int extract_cred(const char *task, char *user, size_t ucap,
+                        char *pass, size_t pcap) {
+    static const char *ukeys[] = {"账号=", "用户名=", "帐号=", "用户=", NULL};
+    static const char *pkeys[] = {"密码=", "口令=", NULL};
+    for (int i = 0; ukeys[i]; i++) {
+        const char *a = strstr(task, ukeys[i]);
+        if (!a) continue;
+        a += strlen(ukeys[i]);
+        size_t n = 0;
+        while (*a && !isspace((unsigned char)*a) && *a != '，' && *a != ',' && n + 1 < ucap) {
+            if ((unsigned char)*a < 0x80 || (unsigned char)*a >= 0xe0) {
+                /* ASCII 或中文首字节 → 收；中文账号少见，遇到标点就停 */
+            }
+            user[n++] = *a++;
+        }
+        user[n] = 0;
+        for (int k = 0; pkeys[k]; k++) {
+            const char *b = strstr(task, pkeys[k]);
+            if (!b) continue;
+            b += strlen(pkeys[k]);
+            size_t m = 0;
+            while (*b && !isspace((unsigned char)*b) && *b != '，' && *b != ',' && m + 1 < pcap)
+                pass[m++] = *b++;
+            pass[m] = 0;
+            if (user[0] && pass[0]) return 1;
+        }
+    }
+    return 0;
+}
+
+/* 返回 1 表示已处理（打印了结果），0 表示不是登录任务 */
+static int run_login_flow(const char *task) {
+    if (!task) return 0;
+    if (!(strstr(task, "登录") || strstr(task, "登陆") || strstr(task, "login")))
+        return 0;
+
+    const char *u = strstr(task, "http");
+    if (!u) return 0;
+    char url[512];
+    size_t ul = 0;
+    while (u[ul] && ul + 1 < sizeof(url)) {
+        unsigned char c = (unsigned char)u[ul];
+        if (c <= 0x20) break;                          /* 空白 */
+        if (c >= 0x80) break;                          /* 中文标点 */
+        url[ul++] = (char)c;
+    }
+    url[ul] = 0;
+    /* 去掉尾部可能粘上的标点 */
+    while (ul > 0 && strchr(".,;:!?)]}>", url[ul-1])) url[--ul] = 0;
+    if (ul < 8) return 0;
+
+    char user[128] = {0}, pass[128] = {0};
+    if (!extract_cred(task, user, sizeof(user), pass, sizeof(pass))) return 0;
+
+    plugin_desc_t *bp = find_plugin("browser");
+    if (!bp) return 0;
+
+    char args[1400];
+    snprintf(args, sizeof(args),
+             "{\"op\":\"autologin\",\"url\":\"%s\",\"user\":\"%s\",\"pass\":\"%s\"}",
+             url, user, pass);
+
+    printf("\n【框架自动登录（不用模型）】\n  目标 %s\n", url);
+    fflush(stdout);
+    char *res = bp->run(args);
+    if (!res) return 0;
+    printf("  [browser] %s\n\n", res);
+
+    /* 失败（验证码认不出 / 没登进去）→ 不截走这次任务，
+     * 把诊断信息交给模型判断下一步（模型能看到 next_steps / diagnosis） */
+    int failed = (!strstr(res, "\"ok\": true") && !strstr(res, "\"ok\":true"))
+                 || strstr(res, "\"captcha_failed\"")
+                 || strstr(res, "\"likely_ok\": false")
+                 || strstr(res, "\"likely_ok\":false");
+    if (failed) {
+        /* 把插件返回的诊断（error / next_steps / diagnosis）摘给模型 */
+        char jerr[128] = {0};
+        jval *j = json_parse(res, jerr, sizeof(jerr));
+        const char *emsg = j ? json_str(json_get(j, "error")) : NULL;
+        const char *hint = j ? json_str(json_get(j, "hint")) : NULL;
+        snprintf(g_login_diag, sizeof(g_login_diag),
+                 "原因：%s%s%s\n原始返回：%.600s",
+                 emsg ? emsg : "登录没通过",
+                 hint ? "（" : "", hint ? hint : "");
+        if (hint) strncat(g_login_diag, "）", sizeof(g_login_diag) - strlen(g_login_diag) - 1);
+        if (j) json_free(j);
+    }
+    free(res);
+    if (failed) {
+        printf("【登录没成，交给模型判断】\n\n");
+        fflush(stdout);
+        return 0;                     /* 继续走模型流程，它能读诊断给建议 */
+    }
+    return 1;
+}
+
 /* 执行联动：返回下游插件的结果（malloc，调用方 free），没有联动返回 NULL */
 static char *pipe_followup(const char *tool, const char *out, const char *why) {
     for (int pi = 0; PIPES[pi].from; pi++) {
@@ -1208,6 +1534,87 @@ static char *pipe_followup(const char *tool, const char *out, const char *why) {
 }
 
 /* ============ main ============ */
+/* ---------- 应用题直连 math ----------
+ *
+ * 工程/行程/鸡兔/环形这类题，math 插件能确定性解（毫秒级），而让 3B 先
+ * 判断"该调哪个 op"再算，实测要 140 秒以上，小模型还经常列错式子。
+ *
+ * 判据直接用 ROUTES 里 math 那条的关键词（框架本来就有，不是新造的词表）。
+ * 插件认不出题型就返回 error → 这里原样回落给模型，不影响开放式问题。
+ */
+static int try_math_direct(const char *task) {
+    if (!task || task[0] == '{') return 0;
+    size_t L = strlen(task);
+    if (L < 8 || L > 320) return 0;
+
+    static const char *K[] = {
+        "工程", "合作", "合做", "相遇", "追及", "环形跑道", "火车", "过桥",
+        "鸡兔", "多少次", "平均值", "平均数", "中位数", "方差", "标准差",
+        "质因数", "阶乘", "排列", "组合", "斐波那契", "百分", "比例",
+        "面积", "周长", "体积", "浓度", "利润", "打折", NULL
+    };
+    int hit = 0;
+    for (int i = 0; K[i]; i++)
+        if (strstr(task, K[i])) { hit = 1; break; }
+    if (!hit) return 0;
+
+    plugin_desc_t *pl = find_plugin("math");
+    if (!pl) return 0;
+
+    char *esc = malloc(strlen(task) * 6 + 16);
+    if (!esc) return 0;
+    json_escape(task, esc, strlen(task) * 6 + 16);
+
+    char *call = malloc(strlen(esc) + 64);
+    if (!call) { free(esc); return 0; }
+    snprintf(call, strlen(esc) + 64, "{\"op\":\"plan\",\"task\":\"%s\"}", esc);
+    char *res = pl->run(call);
+    free(call);
+    free(esc);
+    if (!res) return 0;
+    if (strstr(res, "\"error\"")) { free(res); return 0; }
+
+    printf("%s\n", res);
+    free(res);
+    return 1;
+}
+
+/* ---------- 生成 BGM 直连 music ----------
+ *
+ * "生成一段 mid bgm，风格随意" 这类，交给模型是自己给自己找麻烦：3B 每次
+ * 编出来的音符都不一样，一段 8 秒 BGM 要调三四次 music，五六分钟还不一定
+ * 好听。风格→音阶/节奏/配器 是固定的乐理套路，插件用模板 + 固定种子生成，
+ * 秒级出结果。这里只负责认出"这是要 BGM"，风格词交给插件自己解析。
+ */
+static int try_music_direct(const char *task) {
+    if (!task || task[0] == '{') return 0;
+    int want = strstr(task, "bgm") || strstr(task, "BGM") || strstr(task, "背景音乐")
+            || strstr(task, "配乐") || strstr(task, "一段音乐") || strstr(task, "一段曲子")
+            || strstr(task, "来段音乐") || strstr(task, "生成音乐");
+    if (!want) return 0;
+    if (!(strstr(task, "生成") || strstr(task, "来") || strstr(task, "做")
+          || strstr(task, "写") || strstr(task, "给我") || strstr(task, "整")))
+        return 0;
+
+    plugin_desc_t *pl = find_plugin("music");
+    if (!pl) return 0;
+
+    char *esc = malloc(strlen(task) * 6 + 16);
+    if (!esc) return 0;
+    json_escape(task, esc, strlen(task) * 6 + 16);
+    char *call = malloc(strlen(esc) + 48);
+    if (!call) { free(esc); return 0; }
+    snprintf(call, strlen(esc) + 48, "{\"op\":\"bgm\",\"task\":\"%s\"}", esc);
+    char *res = pl->run(call);
+    free(call);
+    free(esc);
+    if (!res) return 0;
+    if (strstr(res, "\"error\"")) { free(res); return 0; }
+    printf("%s\n", res);
+    free(res);
+    return 1;
+}
+
 int main(int argc, char **argv) {
     const char *task = NULL;
     const char *model = "qwen2.5-3b-q4_k_m.gguf";
@@ -1247,7 +1654,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    read_plugoff();            /* 用户在页面上停用的插件名单 */
     reload_plugins(plugdir);   /* 每次启动重扫：新增/删除 .so 都生效，不用改框架 */
+
+    /* 任务本身就是一条插件命令（{"op":"probe",...}）→ 直接执行，不惊动模型。
+     * 3B 模型不认识这种输入，会当普通文本乱答。 */
+    if (task && try_direct_plugin(task)) return 0;
+    if (task && try_math_direct(task)) return 0;
+    if (task && try_music_direct(task)) return 0;
     if (auto_state_only) {
         /* 高频轮询专用：不探测环境、不输出描述，只回状态，几十字节。
          * 页面打开面板时每 2 秒拉一次，用不着重建整个面板。 */
@@ -1386,6 +1800,11 @@ int main(int argc, char **argv) {
      * "输出表格，再转成 xlsx" 拆成两步：jq 出表格 → doc 打包 xlsx，
      * 上一步的 CSV 自动喂给下一步。以前这里是一个写死的 if（表格+xlsx），
      * 后一句常被忽略，加第三个动作还得改代码。 */
+    /* 登录任务：框架直连（比模型两轮快得多，也不怕 3B 组不出参数） */
+    if (!g_prefetched && g_n > 0) {
+        if (run_login_flow(task)) { free(task_esc); return 0; }
+    }
+
     if (!g_prefetched && g_n > 0 && strlen(task) < 120) {
         int nran = run_task_chunks(task);
         if (nran > 0) {
@@ -1399,6 +1818,15 @@ int main(int argc, char **argv) {
 
     /* system prompt */
     char sys_raw[BIG];
+    if (g_pure_chat_task) {
+        /* 纯对话：不给工具表、不给 op 示例，否则它会挑一个工具去调 */
+        snprintf(sys_raw, sizeof(sys_raw),
+            "你是运行在路由器上的本地 AI 助手。用户问的是知识性 / 解释性问题，"
+            "**不需要任何工具**，直接凭你的知识回答。\n"
+            "回答用中文，简洁准确，不超过 200 字。\n"
+            "只输出一个 JSON：{\"tool\":\"final\",\"answer\":\"你的回答\"}。"
+            "answer 里就是最终答案本身，不要提工具、不要提 JSON。");
+    } else
     snprintf(sys_raw, sizeof(sys_raw),
         "你只能输出一个 JSON 对象，不要解释、不要代码块。"
         "**每个 JSON 都必须有 tool 字段**（比如 {\"tool\":\"doc\",\"op\":\"xlsx\",...}），"
@@ -1406,6 +1834,30 @@ int main(int argc, char **argv) {
         /* 别写 \"插件名\" 这种占位符 —— 3B 会原样照抄，输出 {"tool":"插件名",参数} */
         "调用格式：{\"tool\":\"sys\",\"op\":\"list\",\"path\":\"/tmp\"}"
         "（tool 用上面列表里的名字）；答完：{\"tool\":\"final\",\"answer\":\"...\"}\n"
+        "【op 归属表】op 放在哪个插件是固定的，别放错：\n"
+        "  sys    : shell list du grep read write sysinfo http_get download\n"
+        "  owrt   : uci_get uci_set uci_show uci_commit uci_revert iwinfo iw "
+        "service logread passwd reboot opkg_list\n"
+        "  net    : ping port resolve route arp stat link wifi trace hostname\n"
+        "  math   : calc solve system stat num（应用题给 task 让插件自己判题型）\n"
+        "  doc    : docx xlsx pptx pdf text（Office/PDF 读写）\n"
+        "  jq     : probe get query csv table keys（JSON）\n"
+        "  table  : sort（文本表格排序）\n"
+        "  browser: probe autologin hunt drag captcha cookie shot\n"
+        "  music  : midi render import\n"
+        "  curl   : parse（吃浏览器 Copy as cURL 的整段原文，不是网址）\n"
+        "注意：日志是 owrt 的 logread，不是 sys；OpenWrt 上没有 /var/log/syslog 这个文件。\n"
+        "【示例】\n"
+        "用户：写个 shell 脚本统计日志里 404 的数量\n"
+        "→ {\"tool\":\"sys\",\"op\":\"write\",\"path\":\"/tmp/count404.sh\","
+        "\"content\":\"#!/bin/sh\\nlogread | grep -c -- 404\\n\"}\n"
+        "  然后 → {\"tool\":\"sys\",\"op\":\"shell\",\"cmd\":\"sh /tmp/count404.sh\"}\n"
+        "用户：看看最近 20 行日志\n"
+        "→ {\"tool\":\"owrt\",\"op\":\"logread\",\"lines\":20}\n"
+        "用户：日志里有没有 error\n"
+        "→ {\"tool\":\"owrt\",\"op\":\"logread\",\"lines\":60,\"key\":\"error\"}\n"
+        "用户：抓 http://x/y 看看是不是 404\n"
+        "→ {\"tool\":\"sys\",\"op\":\"http_get\",\"url\":\"http://x/y\"}\n"
         "凡是算式、方程、方程组、统计、数论题，一律调用 math 插件，不要心算。\n"
         "应用题（工程量、行程、相遇追及）把原题文字直接传给 math（只给 task，不要自己指定 op，"
         "也不要自己列式子）——插件会自己判断题型；列错式子算得再准也是错答案。\n",
@@ -1501,8 +1953,62 @@ int main(int argc, char **argv) {
      * 插件明明算出了 3.732 却不展示，用户会以为算错了。 */
     char last_val[64] = {0};
     char *last_result = last_result_init;   /* 最后一次插件返回的 JSON，兜底收尾用 */
-    for (int step = 1; step <= max_steps; step++) {
-        printf("── 第 %d 步 ──\n", step);
+    /* 任务里出现网址 + "抓/看/404/状态码" 时，直接把该调的 JSON 贴给模型抄。
+     * 0.5B/3B 自己选 op 很不可靠：实测会去调 curl（要整段 cURL，不是网址）
+     * 或者 sys 的 list（列出 /tmp 目录），最后胡答一通。给它一条现成的调用
+     * 最省事，也最不容易跑偏。 */
+    if (task && (strstr(task, "http://") || strstr(task, "https://"))
+        && (strstr(task, "404") || strstr(task, "状态码") || strstr(task, "抓")
+            || strstr(task, "访问") || strstr(task, "打开") || strstr(task, "页面"))) {
+        const char *u = strstr(task, "http");
+        char url[600];
+        size_t k = 0;
+        while (u && *u && k + 1 < sizeof(url)
+               && *u != ' ' && *u != '\n' && *u != '\t' && *u != '"' && *u != '\''
+               && *u != '，' && *u != '。')
+            url[k++] = *u++;
+        url[k] = 0;
+        if (k > 8) {
+            char hint[800];
+            snprintf(hint, sizeof(hint),
+                     "（框架提示：任务里有网址 %s。要取状态码和页面内容请直接调用 "
+                     "{\"op\":\"http_get\",\"url\":\"%s\"}，"
+                     "不要用 curl（它要整段 cURL 命令），也不要用 list/du 看目录。）\n",
+                     url, url);
+            log_append(log, BIG, "%s", hint, "");
+        }
+    }
+
+    /* 步数上限不是硬墙：超过 max_steps 后，只要还在推进（没触发熔断）、
+     * 也没超出时间预算，就自动续跑。用户的原话是"4 步不够就把结果存下来
+     * 继续跑"，而不是"4 步一到就报未完成"。 */
+    time_t t_start = time(NULL);
+    long budget = 900;                     /* 默认 15 分钟 */
+    {
+        const char *eb = getenv("AGENT_BUDGET_SEC");
+        if (eb && atol(eb) > 0) budget = atol(eb);
+    }
+    int hard_cap = max_steps * 2;
+    if (hard_cap < 8) hard_cap = 8;
+    if (hard_cap > 16) hard_cap = 16;
+
+    int last_step = 0;
+    for (int step = 1; step <= hard_cap; step++) {
+        last_step = step;
+        if (step > max_steps) {
+            long used = (long)(time(NULL) - t_start);
+            if (used >= budget) {
+                printf("\n⚠ 已跑 %ld 秒，超过时间预算（%ld 秒），停止续跑\n", used, budget);
+                break;
+            }
+            /* 只提示一次，别每步都刷一长串 */
+            if (step == max_steps + 1)
+                printf("（已到设定 %d 步，自动续跑：最多 %d 步 / %ld 秒）\n",
+                       max_steps, hard_cap, budget);
+            printf("── 第 %d 步 ──\n", step);
+        } else {
+            printf("── 第 %d 步 ──\n", step);
+        }
         MEMCHK("step-begin");
 
         size_t lcap = strlen(log) * 6 + 16;
@@ -1540,6 +2046,9 @@ int main(int argc, char **argv) {
         free(body);
         if (!content) {
             fprintf(stderr, "llama-server 无有效响应（%s:%d）\n", host, port);
+            printf("\n⚠ 模型服务没响应（%s:%d）——不是任务本身失败。"
+                   "多半是 llama-server 正在加载模型（装包/重启后要 10~30 秒），"
+                   "等它 health 返回 ok 再重试。\n", host, port);
             break;
         }
         if (!content[0]) {
@@ -1654,6 +2163,26 @@ int main(int argc, char **argv) {
         }
 
         plugin_desc_t *p = find_plugin(tool);
+
+        /* 模型选错插件：op 其实属于别的插件。
+         * 典型：让 sys 执行 logread / iwinfo / uci_get —— 这些是 owrt 的 op。
+         * 框架本来就有 op→插件 的映射表（直连时用），这里复用它纠正，
+         * 别白费一步去报"不支持的 op"。 */
+        if (p) {
+            char op2[48] = {0};
+            json_str_field(content, "op", op2, sizeof(op2));
+            if (op2[0]) {
+                const char *right = op_to_plugin(content, op2);
+                if (right && strcmp(right, tool) != 0) {
+                    plugin_desc_t *p2 = find_plugin(right);
+                    if (p2) {
+                        printf("  （%s 不是 %s 的 op，自动改投 %s 插件）\n", op2, tool, right);
+                        p = p2;
+                    }
+                }
+            }
+        }
+
         if (!p) {
             printf("  ! 未知工具 %s\n", tool);
             log_append(log, BIG, "%s%s", "（上一轮：没有该工具，可用工具见上）\n", "");
@@ -1688,6 +2217,42 @@ int main(int argc, char **argv) {
         if (!out) {
             printf("  ! 插件返回空\n");
             continue;
+        }
+
+        /* 同一个调用连续失败两次就别再试了。
+         * 小模型遇到"缺少参数"这类错误会原样重发，把 step 全烧在同一个
+         * 错误上（实测：grep 缺 pattern 连发 3 次，4 步一步没成）。
+         * 与其耗到步数上限再报"未完成"，不如立刻停并说清缺什么。 */
+        {
+            static char last_sig[700];
+            static char fail_tool[64];
+            static int fail_cnt;
+            if (strstr(out, "\"error\"")) {
+                char sig[700];
+                snprintf(sig, sizeof(sig), "%s|%.500s", tool, enr);
+                /* 同一插件连续失败 2 次就停。小模型不只原样重发，还会换着
+                 * 花样发错 op（logread 给 sys、grep 找不到 /var/log/syslog），
+                 * 光比对"参数完全相同"会被它绕过去，一路烧到步数上限。 */
+                if (!strcmp(fail_tool, tool)) fail_cnt++;
+                else { snprintf(fail_tool, sizeof(fail_tool), "%s", tool); fail_cnt = 1; }
+                if (!strcmp(sig, last_sig) || fail_cnt >= 2) {
+                    char msg[400];
+                    snprintf(msg, sizeof(msg), "%s", out);
+                    utf8_cut(msg, 240);
+                    printf("  ! 插件 %s 连续失败两次，停止重试\n", tool);
+                    printf("\n最终回答: 没能完成。%s 返回的错误是：%s\n"
+                           "（重复同一个调用只会得到同样的错误，需要补参数或换插件）\n",
+                           tool, msg);
+                    free(out);
+                    rc = 0;
+                    break;
+                }
+                snprintf(last_sig, sizeof(last_sig), "%s", sig);
+            } else {
+                last_sig[0] = 0;
+                fail_cnt = 0;
+                fail_tool[0] = 0;
+            }
         }
         /* 记下完整结果：模型没给 final 时拿它收尾，别白算一场 */
         free(last_result);
@@ -1756,7 +2321,10 @@ int main(int argc, char **argv) {
             free(ans);
             rc = 0;
         } else {
-            printf("\n⚠ 达到 %d 步上限，未完成\n", max_steps);
+            printf("\n⚠ 跑到第 %d 步仍未给出最终答案。\n"
+                   "（已产出的文件都保存在 /tmp 或 /tmp/llama_agent/ 下，"
+                   "上面每一步的输出里能看到路径；可以让我接着做，"
+                   "或者把任务拆小一点重问）\n", last_step);
         }
     }
     free(last_result);

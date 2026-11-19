@@ -37,10 +37,18 @@ typedef struct {
 static int jget(const char *js, const char *key, char *out, size_t cap) {
     char pat[64];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(js, pat);
-    if (!p) return -1;
-    p = strchr(p + strlen(pat), ':');
-    if (!p) return -1;
+    /* 只认「后面紧跟冒号」的匹配：字段值恰好等于某个 key 名时会误命中
+     * （{"op":"query",...,"query":"x"} 找 query 会先撞上 op 的值），
+     * 那样解析出来的就是隔壁字段。 */
+    const char *p = js, *found = NULL;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *q = p + strlen(pat);
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == ':') { found = q; break; }
+        p = q;
+    }
+    if (!found) return -1;
+    p = found;
     p++;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     if (*p != '"') return -1;
@@ -142,6 +150,39 @@ static int parse_notes(const char *js, note_t *out, int maxn, double beat, int c
         }
         p = brace ? brace : p + 7;
     }
+    return n;
+}
+
+
+/* 按方括号截取某一条轨（melody / bass / drums）单独解析。
+ *
+ * 为什么必须截：parse_notes 里的时间 t 是【顺序累加】的。整段 JSON 一次
+ * 喂进去，melody 播完 bass 接着播、bass 播完 drums 接着播 —— 三轨首尾相连，
+ * 总时长直接翻两三倍（8 小节 29 秒的曲子渲染出 59 秒）。
+ * 每轨单独解析，各自的 start 都从 0 起，才是并行的多轨。
+ */
+static int parse_track(const char *js, const char *key, note_t *out, int maxn,
+                       double beat, int ch) {
+    char pat[40];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *k = strstr(js, pat);
+    if (!k) return 0;
+    const char *b = strchr(k, '[');
+    if (!b) return 0;
+    int depth = 0;
+    const char *e = b;
+    for (; *e; e++) {
+        if (*e == '[') depth++;
+        else if (*e == ']') { depth--; if (depth == 0) { e++; break; } }
+    }
+    size_t len = (size_t)(e - b);
+    if (len > 60000) len = 60000;
+    char *seg = malloc(len + 1);
+    if (!seg) return 0;
+    memcpy(seg, b, len);
+    seg[len] = 0;
+    int n = parse_notes(seg, out, maxn, beat, ch);
+    free(seg);
     return n;
 }
 
@@ -254,23 +295,11 @@ static char *op_midi(const char *json) {
     int ntrk = 0;
 
     if (mp || bp || dp) {
-        char sub[65536];
-        if (mp) {
-            /* 取 melody 数组内容（到下一个 "xxx": 或结尾） */
-            snprintf(sub, sizeof(sub), "%s", mp);
-            total += parse_notes(sub, notes + total, MAX_NOTE - total, beat, 0);
-            ntrk++;
-        }
-        if (bp) {
-            snprintf(sub, sizeof(sub), "%s", bp);
-            total += parse_notes(sub, notes + total, MAX_NOTE - total, beat, 1);
-            ntrk++;
-        }
-        if (dp) {
-            snprintf(sub, sizeof(sub), "%s", dp);
-            total += parse_notes(sub, notes + total, MAX_NOTE - total, beat, 9);
-            ntrk++;
-        }
+        if (mp) { total += parse_track(json, "melody", notes + total, MAX_NOTE - total, beat, 0); ntrk++; }
+        if (bp) { total += parse_track(json, "bass",   notes + total, MAX_NOTE - total, beat, 1); ntrk++; }
+        if (dp) { total += parse_track(json, "drums",  notes + total, MAX_NOTE - total, beat, 9); ntrk++; }
+        if (!mp && strstr(json, "\"notes\""))
+            total += parse_track(json, "notes", notes + total, MAX_NOTE - total, beat, 0);
     } else {
         total = parse_notes(json, notes, MAX_NOTE, beat, 0);
         ntrk = 1;
@@ -640,8 +669,11 @@ static char *op_render(const char *json) {
 
     int nn = 0;
     double beat = 60.0 / tempo;
-    if (strstr(json, "\"notes\"") || strstr(json, "\"melody\"")) {
-        nn = parse_notes(json, notes, MAX_NOTE, beat, 0);
+    if (strstr(json, "\"melody\"") || strstr(json, "\"notes\"")) {
+        nn  = parse_track(json, "melody", notes, MAX_NOTE, beat, 0);
+        nn += parse_track(json, "notes",  notes + nn, MAX_NOTE - nn, beat, 0);
+        nn += parse_track(json, "bass",   notes + nn, MAX_NOTE - nn, beat, 1);
+        nn += parse_track(json, "drums",  notes + nn, MAX_NOTE - nn, beat, 9);
     }
     char midi_path[768] = {0};
     if (p[0]) {
@@ -676,6 +708,267 @@ static char *op_import(const char *json) {
     return r;
 }
 
+/* ---------------- op: bgm（风格模板生成） ----------------
+ *
+ * 为什么不让模型编音符：3B 每次给的 pitch/dur 都不同，一段 8 秒的 BGM
+ * 要调三四次 music 才凑合，动辄五六分钟，还不一定好听。风格→音阶/节奏/
+ * 低音/鼓 是固定的乐理套路，用模板 + 固定种子生成，秒级出结果且可复现。
+ */
+typedef struct {
+    const char *id;        /* 内部名 */
+    const char *keys;      /* 中文/英文关键字，| 分隔 */
+    int tempo;
+    int root;              /* 主音 MIDI */
+    const int *scale;      /* 音阶 */
+    int slen;
+    int drums;             /* 0/1 */
+    int density;           /* 每小节音符数 4/6/8 */
+    int mood;              /* 0=明亮 1=暗淡（决定上行/下行偏好） */
+} bgm_style_t;
+
+static const int SC_MAJOR[]  = {0, 2, 4, 5, 7, 9, 11};
+static const int SC_MINOR[]  = {0, 2, 3, 5, 7, 8, 10};
+static const int SC_PENTA[]  = {0, 2, 4, 7, 9};
+static const int SC_DORIAN[] = {0, 2, 3, 5, 7, 9, 10};
+
+static const bgm_style_t BGM_STYLES[] = {
+    /* id        关键字                                             tempo root scale     slen drums dens mood */
+    {"happy",   "欢快|轻松|明快|愉快|happy|upbeat",                      138, 60, SC_MAJOR,  7, 1, 8, 0},
+    {"calm",    "舒缓|安静|温柔|放松|calm|chill|ambient",                76,  57, SC_MAJOR,  7, 0, 4, 0},
+    {"sad",     "悲伤|忧伤|难过|伤感|sad|melancholy",                    66,  57, SC_MINOR,  7, 0, 4, 1},
+    {"tense",   "紧张|紧迫|悬疑|危机|tense|thriller",                    150, 52, SC_MINOR,  7, 1, 8, 1},
+    {"mystery", "神秘|诡异|悬疑感|mystery|eerie",                        84,  50, SC_DORIAN, 7, 0, 6, 1},
+    {"electronic","电子|科技|赛博|electronic|synth|cyber",               128, 48, SC_MINOR,  7, 1, 8, 0},
+    {"game",    "8bit|8位|游戏|像素|红白机|game|chiptune",               160, 60, SC_MAJOR,  7, 1, 8, 0},
+    {"march",   "进行曲|激昂|heroic|march|epic",                        120, 55, SC_MAJOR,  7, 1, 6, 0},
+    {"chinese", "中国风|古风|五声|chinese|oriental",                     92,  60, SC_PENTA,  5, 0, 6, 0},
+    {NULL, NULL, 0, 0, NULL, 0, 0, 0, 0}
+};
+
+/* 固定种子的 LCG：同样的风格 + 小节数，每次生成结果一致（可复现） */
+static unsigned int bgm_rand(unsigned int *st) {
+    *st = (*st * 1103515245u + 12345u) & 0x7fffffffu;
+    return *st;
+}
+
+static const bgm_style_t *bgm_pick(const char *style) {
+    if (style && style[0]) {
+        for (int i = 0; BGM_STYLES[i].id; i++)
+            if (!strcasecmp(style, BGM_STYLES[i].id)) return &BGM_STYLES[i];
+        for (int i = 0; BGM_STYLES[i].id; i++) {
+            char keys[256];
+            snprintf(keys, sizeof(keys), "%s", BGM_STYLES[i].keys);
+            char *sv = NULL;
+            for (char *k = strtok_r(keys, "|", &sv); k; k = strtok_r(NULL, "|", &sv))
+                if (k[0] && strstr(style, k)) return &BGM_STYLES[i];
+        }
+    }
+    return NULL;     /* 随意 → 由调用方挑一个 */
+}
+
+static char *op_bgm(const char *json) {
+    char style[128] = {0}, p[512] = {0};
+    jget(json, "style", style, sizeof(style));
+    if (!style[0]) jget(json, "task", style, sizeof(style));   /* 允许直接传整句 */
+    jget(json, "path", p, sizeof(p));
+
+    const bgm_style_t *st = bgm_pick(style);
+    int picked_at_random = 0;
+    if (!st) {
+        /* 随意 / 没指定：按当前秒数轮换，避免每次都同一个 */
+        int n = 0;
+        while (BGM_STYLES[n].id) n++;
+        st = &BGM_STYLES[(int)(time(NULL) % n)];
+        picked_at_random = 1;
+    }
+
+    long bars = (long)jget_num(json, "bars", 0);
+    double tempo = jget_num(json, "tempo", st->tempo);
+    if (tempo < 40 || tempo > 260) tempo = st->tempo;
+
+    /* 时长：优先 seconds 字段，其次从整句里抠 "30秒" 这种写法。
+     * 用户说"生成 30 秒的 BGM"，就得真给 30 秒 —— 以前完全不看这个数字。 */
+    double want_sec = jget_num(json, "seconds", 0);
+    if (want_sec <= 0 && style[0]) {
+        const char *u = strstr(style, "秒");
+        if (u) {
+            const char *q = u;
+            while (q > style && (q[-1] == ' ' || q[-1] == '\t')) q--;
+            const char *end = q;
+            while (q > style && q[-1] >= '0' && q[-1] <= '9') q--;
+            if (end > q) {
+                char num[16];
+                size_t L = (size_t)(end - q);
+                if (L < sizeof(num)) {
+                    memcpy(num, q, L);
+                    num[L] = 0;
+                    want_sec = atof(num);
+                }
+            }
+        }
+    }
+
+    if (bars <= 0) {
+        if (want_sec > 0) {
+            /* 一小节 4 拍 → 每小节 4*60/tempo 秒 */
+            double bar_sec = 4.0 * 60.0 / tempo;
+            bars = (long)(want_sec / bar_sec + 0.5);
+        } else {
+            bars = 8;
+        }
+    }
+    if (bars < 1) bars = 1;
+    if (bars > 64) bars = 64;
+    if (want_sec > 0 && bars * 4.0 * 60.0 / tempo > want_sec * 1.15) {
+        /* 宁可短一点也不超太多 */
+        bars = (long)(want_sec * tempo / 240.0);
+        if (bars < 1) bars = 1;
+    }
+
+    char base[512];
+    if (p[0]) snprintf(base, sizeof(base), "%s", p);
+    else snprintf(base, sizeof(base), "%s/bgm_%s_%ld", WORK_DIR, st->id, (long)time(NULL));
+    /* 去掉用户可能带的扩展名 */
+    char *dot = strrchr(base, '.');
+    if (dot && (!strcmp(dot, ".mid") || !strcmp(dot, ".mp3") || !strcmp(dot, ".wav")))
+        *dot = 0;
+
+    unsigned int seed = 0;
+    for (const char *q = st->id; *q; q++) seed = seed * 131u + (unsigned char)*q;
+    seed = seed * 131u + (unsigned int)bars;
+
+    /* 组装 melody / bass / drums 三段 */
+    char mel[12000] = {0}, bas[3000] = {0}, drm[3000] = {0};
+    size_t mi = 0, bi = 0, di = 0;
+    int nn = 0;
+
+    for (long bar = 0; bar < bars; bar++) {
+        /* 低音：每小节主音，两拍一个 */
+        for (int b = 0; b < 2; b++) {
+            int bp = st->root - 12 + st->scale[0];
+            bi += (size_t)snprintf(bas + bi, sizeof(bas) - bi, "%s{\"pitch\":%d,\"dur\":2}",
+                                   bi ? "," : "", bp);
+        }
+        /* 鼓：强拍底鼓、弱拍军鼓 */
+        if (st->drums) {
+            di += (size_t)snprintf(drm + di, sizeof(drm) - di, "%s{\"pitch\":36,\"dur\":1}",
+                                   di ? "," : "");
+            di += (size_t)snprintf(drm + di, sizeof(drm) - di, ",{\"pitch\":38,\"dur\":1}");
+            di += (size_t)snprintf(drm + di, sizeof(drm) - di, ",{\"pitch\":36,\"dur\":1}");
+            di += (size_t)snprintf(drm + di, sizeof(drm) - di, ",{\"pitch\":38,\"dur\":1}");
+        }
+        /* 旋律：按 density 均分 4 拍，音级在音阶上随机走 */
+        int nN = st->density;
+        double dur = 4.0 / nN;
+        int deg = 0;
+        for (int k = 0; k < nN; k++) {
+            unsigned int r = bgm_rand(&seed);
+            int step = (int)(r % 3) - 1;              /* -1 / 0 / +1 级 */
+            if (st->mood == 1 && (r & 4)) step = -abs(step);   /* 暗淡偏好下行 */
+            deg += step;
+            if (deg < 0) deg += st->slen;
+            if (deg >= st->slen) deg -= st->slen;
+            int oct = (int)((r >> 8) % 3);            /* 偶尔跳八度 */
+            int pitch = st->root + st->scale[deg] + (oct == 2 ? 12 : 0);
+            if (pitch < 24) pitch += 12;
+            if (pitch > 96) pitch -= 12;
+            mi += (size_t)snprintf(mel + mi, sizeof(mel) - mi,
+                                   "%s{\"pitch\":%d,\"dur\":%.3g}",
+                                   mi ? "," : "", pitch, dur);
+            nn++;
+        }
+        /* 每隔两小节让旋律落回主音，听起来有句读 */
+        if (bar % 2 == 1 && nN > 1) {
+            mi = 0;
+            /* 简化：直接在上面已生成的内容里不动，只是计数 */
+            (void)mi;
+            break;
+        }
+    }
+
+    /* 整段重新生成（上面为了控制句读的写法太绕，这里用直白版本保证正确） */
+    mi = bi = di = 0;
+    mel[0] = bas[0] = drm[0] = 0;
+    nn = 0;
+    seed = 0;
+    for (const char *q = st->id; *q; q++) seed = seed * 131u + (unsigned char)*q;
+    seed = seed * 131u + (unsigned int)bars;
+
+    for (long bar = 0; bar < bars; bar++) {
+        for (int b = 0; b < 2; b++)
+            bi += (size_t)snprintf(bas + bi, sizeof(bas) - bi, "%s{\"pitch\":%d,\"dur\":2}",
+                                   bi ? "," : "", st->root - 12 + st->scale[0]);
+        if (st->drums) {
+            const int pat[4] = {36, 38, 36, 38};
+            for (int k = 0; k < 4; k++)
+                di += (size_t)snprintf(drm + di, sizeof(drm) - di, "%s{\"pitch\":%d,\"dur\":1}",
+                                       di ? "," : "", pat[k]);
+        }
+        int nN = st->density;
+        double dur = 4.0 / nN;
+        int deg = 0;
+        for (int k = 0; k < nN; k++) {
+            unsigned int r = bgm_rand(&seed);
+            int step = (int)(r % 3) - 1;
+            if (st->mood == 1 && (r & 4)) step = -abs(step);
+            deg += step;
+            while (deg < 0) deg += st->slen;
+            while (deg >= st->slen) deg -= st->slen;
+            int pitch = st->root + st->scale[deg];
+            if (((r >> 8) % 6) == 0) pitch += 12;
+            if (bar % 2 == 1 && k == nN - 1) pitch = st->root;   /* 句尾回主音 */
+            if (pitch < 24) pitch += 12;
+            if (pitch > 96) pitch -= 12;
+            mi += (size_t)snprintf(mel + mi, sizeof(mel) - mi,
+                                   "%s{\"pitch\":%d,\"dur\":%.3g}",
+                                   mi ? "," : "", pitch, dur);
+            nn++;
+        }
+    }
+
+    /* 先出 MIDI */
+    char j1[20000];
+    snprintf(j1, sizeof(j1),
+             "{\"path\":\"%s.mid\",\"tempo\":%.4g,\"melody\":[%s],\"bass\":[%s]%s%s%s}",
+             base, tempo, mel, bas,
+             di ? ",\"drums\":[" : "", di ? drm : "",
+             di ? "]}" : "}");
+    char *mid_res = op_midi(j1);
+
+    /* 再合成 MP3 */
+    char j2[20000];
+    snprintf(j2, sizeof(j2),
+             "{\"out\":\"%s\",\"tempo\":%.4g,\"melody\":[%s],\"bass\":[%s]%s%s%s}",
+             base, tempo, mel, bas,
+             di ? ",\"drums\":[" : "", di ? drm : "",
+             di ? "]}" : "}");
+    char *mp3_res = op_render(j2);
+    free(mid_res);
+
+    if (!mp3_res) { free(mp3_res); return jerr("合成 MP3 失败"); }
+
+    char text[2000], ans[300];
+    snprintf(text, sizeof(text),
+        "**BGM 已生成**（风格模板，确定性生成）\n\n"
+        "| 项 | 值 |\n|---|---|\n"
+        "| 风格 | `%s`%s |\n"
+        "| 速度 | %.0f BPM |\n"
+        "| 小节 | %ld（约 %.1f 秒） |\n"
+        "| 旋律音符 | %d 个 |\n"
+        "| 配器 | 旋律%s%s |\n"
+        "| MIDI | `%s.mid` |\n"
+        "| MP3 | `%s.mp3` |\n\n"
+        "要换风格就改 style：欢快 / 舒缓 / 悲伤 / 紧张 / 神秘 / 电子 / game / march / chinese",
+        st->id, picked_at_random ? "（随机挑的）" : "",
+        tempo, bars, bars * 4 * 60.0 / tempo, nn,
+        bas[0] ? " + 低音" : "", di ? " + 鼓" : "",
+        base, base);
+    snprintf(ans, sizeof(ans), "BGM 已生成：%s（%s，%.0f BPM，%ld 小节）",
+             st->id, picked_at_random ? "随机" : "指定", tempo, bars);
+    free(mp3_res);
+    return jpair(text, ans);
+}
+
 /* ---------------- 入口 ---------------- */
 static char *run(const char *json_in) {
     char op[32] = {0};
@@ -692,6 +985,7 @@ static char *run(const char *json_in) {
     if (!strcmp(op, "midi") || !strcmp(op, "make"))   return op_midi(json_in);
     if (!strcmp(op, "render") || !strcmp(op, "play")) return op_render(json_in);
     if (!strcmp(op, "import") || !strcmp(op, "wav"))  return op_import(json_in);
+    if (!strcmp(op, "bgm") || !strcmp(op, "music"))   return op_bgm(json_in);
 
     return jerr("不支持的 op：midi / render / import");
 }
@@ -699,8 +993,9 @@ static char *run(const char *json_in) {
 static plugin_desc_t desc = {
     PLUGIN_API_VERSION,
     "music",
-    "音乐（纯 C）：生成 MIDI(midi) / 合成 FC 音色 MP3(render) / 导入现成 MIDI 转 MP3(import)。"
-    "notes 格式 [{\"pitch\":69,\"dur\":1}]，dur 以拍为单位；pitch 0 表示休止",
+    "音乐（纯 C）：**要背景音乐/BGM 一律用 op=bgm 加 style**，插件按风格模板确定性生成"
+    "（比你逐个音符编快得多，也不会跑调）；style 可选 欢快/舒缓/悲伤/紧张/神秘/电子/game/march/chinese，"
+    "不给就随机。其它：midi=手写音符出 MIDI，render=合成 MP3，import=读 MIDI 转 MP3",
     "{\"op\":\"midi\",\"path\":\"/tmp/llama_agent/a.mid\",\"tempo\":160,"
     "\"notes\":[{\"pitch\":72,\"dur\":1},{\"pitch\":74,\"dur\":1}]}"
     "  或分轨 {\"op\":\"midi\",\"melody\":[...],\"bass\":[...],\"drums\":[...]}"

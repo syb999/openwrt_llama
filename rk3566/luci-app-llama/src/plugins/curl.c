@@ -53,10 +53,18 @@ typedef struct {
 static int jget(const char *js, const char *key, char *out, size_t cap) {
     char pat[64];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(js, pat);
-    if (!p) return -1;
-    p = strchr(p + strlen(pat), ':');
-    if (!p) return -1;
+    /* 只认「后面紧跟冒号」的匹配：字段值恰好等于某个 key 名时会误命中
+     * （{"op":"query",...,"query":"x"} 找 query 会先撞上 op 的值），
+     * 那样解析出来的就是隔壁字段。 */
+    const char *p = js, *found = NULL;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *q = p + strlen(pat);
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == ':') { found = q; break; }
+        p = q;
+    }
+    if (!found) return -1;
+    p = found;
     p++;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     if (*p != '"') return -1;
@@ -1022,7 +1030,11 @@ static char *do_send(curlreq_t *r, int show_body) {
 static int build_request(const char *json, curlreq_t *r, char *err, size_t errcap) {
     memset(r, 0, sizeof(*r));
     jget(json, "url", r->url, sizeof(r->url));
-    if (!r->url[0]) { snprintf(err, errcap, "缺少 url"); return -1; }
+    if (!r->url[0]) {
+        snprintf(err, errcap, "解析出来的 cURL 里没有 URL。确认粘贴的是完整命令"
+                              "（要包含 curl + 网址），例如：curl 'https://example.com/api' -H 'A: b'");
+        return -1;
+    }
     if (strncmp(r->url, "http://", 7) && strncmp(r->url, "https://", 8)) {
         snprintf(err, errcap, "只支持 http/https");
         return -1;
@@ -1074,7 +1086,10 @@ static char *run(const char *json_in) {
         }
     } else if (!strcmp(op, "parse")) {
         free(r);
-        return jerr("缺少 curl（要粘贴浏览器 Copy as cURL 的整段内容）");
+        return jerr("缺少 curl 字段。这个 op 要的是浏览器「Copy as cURL」的【整段原文】，"
+                    "不是 URL。写法：{\"op\":\"parse\",\"curl\":\"curl 'https://x' -H '...'\"}。"
+                    "只想要一个网址的内容，用 sys 插件的 http_get："
+                    "{\"op\":\"http_get\",\"url\":\"https://x\"}");
     } else {
         if (build_request(json_in, r, err, sizeof(err)) != 0) {
             free(r);
