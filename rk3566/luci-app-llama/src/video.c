@@ -229,6 +229,7 @@ static int run_argv(argv_t *a, char *errbuf, size_t errcap) {
 }
 
 /* 前向声明：这些实现在后面的"增强部分"，但 op_portrait 要用到 */
+static double fps_of(const char *path);   /* 前向声明 */
 static double duration_of(const char *path);
 /* 跑 shell 管道（解码 | 重建 | 编码），返回退出码 */
 static int run_pipe_sync(const char *cmd) {
@@ -996,6 +997,24 @@ static double duration_of(const char *path) {
     if (fgets(line, sizeof(line), pp)) d = atof(line);
     pclose(pp);
     return d;
+}
+
+/* 取帧率（r_frame_rate 形如 25/1） */
+static double fps_of(const char *path) {
+    char cmd[600], buf[128];
+    snprintf(cmd, sizeof(cmd),
+             "%s -v error -select_streams v:0 -show_entries stream=r_frame_rate "
+             "-of default=nw=1:nk=1 \"%s\" 2>/dev/null", fp_path(), path);
+    FILE *p = popen(cmd, "r");
+    if (!p) return 25.0;
+    double v = 25.0;
+    if (fgets(buf, sizeof(buf), p)) {
+        double num = 0, den = 1;
+        if (sscanf(buf, "%lf/%lf", &num, &den) == 2 && den > 0) v = num / den;
+        else if (sscanf(buf, "%lf", &num) == 1 && num > 0) v = num;
+    }
+    pclose(p);
+    return v > 0.1 ? v : 25.0;
 }
 
 /* 后台起 ffmpeg：不等待，stdout/stderr 丢 /dev/null，进度写 progfile */
@@ -2010,6 +2029,76 @@ static char *op_desub(const char *json) {
         return json_pair(text, ans, extra);
     }
     char vf[900];
+    /* npu：调板上 /opt/py/migan.sh（MI-GAN 6M 参数跑 RK3566 NPU，实测 1.97 秒/帧）。
+     * 比 CPU 上的 LaMa 快 5 倍；脚本自己会停 LLM 腾内存、跑完再恢复。 */
+    if (!strcmp(mode, "npu") || !strcmp(mode, "ai")) {
+        char text[700], ans[240], extra[480], cmd[900], id[64], prog[512], logf[512];
+        if (access("/opt/py/migan.sh", X_OK) != 0)
+            return errf("NPU 去字幕未安装（需要板上 /opt/py/migan.sh）%s%s", "", "");
+        /* 字幕带外扩：自动探测常常只圈到字心，描边/下沿会留下淡淡残影 */
+        int ny = (int)jget_int(json, "band_y", -1);
+        int nh = (int)jget_int(json, "band_h", -1);
+        if (ny >= 0 && nh > 0) {
+            y = ny; hh = nh;
+        } else {
+            y = y - 4;
+            if (y < 0) y = 0;
+            hh = hh + 12;
+            if (y + hh > sh) hh = sh - y;
+        }
+        double dur = duration_of(path);
+        double fps = fps_of(path);
+        if (fps <= 1) fps = 25;
+        int nfr = (int)(dur * fps + 0.5);
+        if (nfr < 1) nfr = 1;
+        snprintf(id, sizeof(id), "npu_%ld", (long)time(NULL));
+        mkdir("/tmp/llama_agent", 0777);   /* 重启后父目录不存在，不建的话下面全失败 */
+        mkdir(VJOBS, 0777);
+        snprintf(prog, sizeof(prog), "%s/%s.prog", VJOBS, id);
+        snprintf(logf, sizeof(logf), "%s/%s.log", VJOBS, id);
+        snprintf(cmd, sizeof(cmd),
+                 "MIGAN_PROG='%s' /opt/py/migan.sh '%s' '%s' --band-y %d --band-h %d",
+                 prog, path, out, y, hh);
+        int want_async = (int)jget_int(json, "async", 1);
+        if (want_async) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                setsid();
+                int fd = open(logf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd < 0) fd = open("/dev/null", O_WRONLY);
+                if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+                execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+                _exit(127);
+            }
+            if (pid < 0) return errf("启动 NPU 任务失败%s%s", "", "");
+            job_record(id, (int)pid, out, dur, "npu去字幕");
+            snprintf(text, sizeof(text),
+                     "**NPU 去字幕已开始（后台）**\n\n| 项 | 值 |\n|---|---|\n"
+                     "| 任务 ID | `%s` |\n| 字幕区域 | `x=0 y=%d w=%d h=%d` |\n"
+                     "| 引擎 | MI-GAN（RK3566 NPU，约 2 秒/帧） |\n"
+                     "| 帧数 | %d 帧（约 %.0f 分钟） |\n| 输出 | `%s` |\n",
+                     id, y, sw, hh, nfr, nfr * 2.0 / 60.0, out);
+            snprintf(ans, sizeof(ans),
+                     "NPU 去字幕已开始（%d 帧，约 %.0f 分钟），用 job 查进度", nfr, nfr * 2.0 / 60.0);
+            snprintf(extra, sizeof(extra),
+                     "\"id\":\"%s\",\"async\":1,\"pid\":%d,\"out\":\"%s\","
+                     "\"total_sec\":%.1f,\"kind\":\"npu去字幕\"",
+                     id, (int)pid, out, dur);
+            return json_pair(text, ans, extra);
+        }
+        int rc = run_pipe_sync(cmd);
+        if (rc != 0) return errf("NPU 去字幕失败（退出码 %d），见 %s%s", logf, "");
+        struct stat stn; stat(out, &stn);
+        snprintf(text, sizeof(text),
+                 "**NPU 去字幕完成**\n\n| 项 | 值 |\n|---|---|\n"
+                 "| 字幕区域 | `x=0 y=%d w=%d h=%d` |\n| 引擎 | MI-GAN（NPU） |\n"
+                 "| 文件 | `%s` |\n", y, sw, hh, out);
+        snprintf(ans, sizeof(ans), "NPU 去字幕完成，%.1f MB", stn.st_size / 1048576.0);
+        snprintf(extra, sizeof(extra),
+                 "\"path\":\"%s\",\"file\":\"%s\",\"format\":\"mp4\",\"size\":%ld",
+                 out, out, (long)stn.st_size);
+        return json_pair(text, ans, extra);
+    }
     /* crop_extend：裁掉字幕带，底部用"最后几行镜像"补齐原高度。
      * 比"拉伸回原尺寸"好：不产生纵向变形（实测拉 12% 人脸会变长）。 */
     if (!strcmp(mode, "crop_extend") || !strcmp(mode, "extend")) {
