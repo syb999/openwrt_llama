@@ -21,7 +21,7 @@ _spec.loader.exec_module(D)
 
 SZ = 512
 FF = '/usr/bin/ffmpeg-rkrga'
-MODEL = os.path.join(DESUB_DIR, 'migan.rknn')
+MODEL = os.path.join(DESUB_DIR, 'migan_noclip.rknn')
 BIN = os.path.join(DESUB_DIR, 'migan_rknn')
 LOADER = '/opt/glibc/ld-linux-aarch64.so.1'
 LIBPATH = '/opt/glibc:/opt/rknpu'
