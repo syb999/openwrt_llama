@@ -1,0 +1,809 @@
+diff --git a/target/linux/rockchip/Makefile b/target/linux/rockchip/Makefile
+index bcc0cc3f..4996b434 100644
+--- a/target/linux/rockchip/Makefile
++++ b/target/linux/rockchip/Makefile
+@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
+ 
+ BOARD:=rockchip
+ BOARDNAME:=Rockchip
+-FEATURES:=ext4 audio usb usbgadget display gpio fpu rootfs-part boot-part squashfs
++FEATURES:=ext4 audio usb usbgadget display gpio fpu pci pcie rootfs-part boot-part squashfs
+ SUBTARGETS:=armv8
+ 
+ KERNEL_PATCHVER=5.4
+diff --git a/target/linux/rockchip/armv8/base-files/etc/board.d/01_leds b/target/linux/rockchip/armv8/base-files/etc/board.d/01_leds
+index bba3e2aa..29f97b0a 100755
+--- a/target/linux/rockchip/armv8/base-files/etc/board.d/01_leds
++++ b/target/linux/rockchip/armv8/base-files/etc/board.d/01_leds
+@@ -13,6 +13,24 @@ friendlyarm,nanopi-r2s)
+ 	ucidef_set_led_netdev "wan" "WAN" "$boardname:green:wan" "eth0"
+ 	ucidef_set_led_netdev "lan" "LAN" "$boardname:green:lan" "eth1"
+ 	;;
++hinlink,opc-h28k)
++	ucidef_set_led_netdev "lan" "LAN" "amber:lan" "eth0"
++	ucidef_set_led_netdev "wan" "WAN" "blue:wan" "eth1"
++	;;
++panther,x2)
++	# Four single-colour LEDs on the front: power, status, network, wifi.
++	# Power stays on (it is the "none" default), status shows the system is
++	# alive, and the two link LEDs follow their interface instead of being
++	# stuck on like in the vendor firmware.
++	ucidef_set_led_heartbeat "status" "STATUS" "green:status"
++	ucidef_set_led_netdev "eth" "ETH" "green:eth" "eth0"
++	ucidef_set_led_netdev "wifi" "WIFI" "green:wifi" "wlan0"
++	;;
++jp-tvbox,rk3566)
++	# Front panel: green "power" (gpio0 RK_PD3, active low) stays on as the
++	# running indicator, red "status" (gpio0 RK_PD4) shows the heartbeat.
++	ucidef_set_led_heartbeat "status" "STATUS" "red:status"
++	;;
+ esac
+ 
+ board_config_flush
+diff --git a/target/linux/rockchip/armv8/base-files/etc/board.d/02_network b/target/linux/rockchip/armv8/base-files/etc/board.d/02_network
+index 48133c81..9757b95c 100755
+--- a/target/linux/rockchip/armv8/base-files/etc/board.d/02_network
++++ b/target/linux/rockchip/armv8/base-files/etc/board.d/02_network
+@@ -11,6 +11,86 @@ rockchip_setup_interfaces()
+ 	friendlyarm,nanopi-r2s)
+ 		ucidef_set_interfaces_lan_wan 'eth1' 'eth0'
+ 		;;
++	hinlink,opc-h28k)
++		# eth0 is the on-board GMAC (RTL8211F RGMII PHY) and eth1 the
++		# RTL8111H sitting behind the PCIe x1 lane.  The PCIe NIC is a
++		# loadable module and therefore probes after the built-in GMAC,
++		# which is why the GMAC owns eth0.  These roles match 01_leds
++		# (WAN on eth1, LAN on eth0) and the vendor firmware.
++		ucidef_set_interfaces_lan_wan 'eth0' 'eth1'
++		;;
++	panther,x2)
++		# Single Gigabit port (SoC GMAC1 with an RTL8211F RGMII PHY), and it
++		# is the uplink: the board hangs off an existing network and gets
++		# its address by DHCP, so the port is the WAN, not a LAN bridge.
++		# (The "lan" zone is therefore empty; the wan zone is opened right
++		# below so that a freshly flashed headless box stays reachable.)
++		ucidef_set_interface_wan 'eth0' 'dhcp'
++
++		# The wan stays a plain device on purpose.  It was tried as a
++		# bridge over eth0 (so the wireless could be bridged onto the
++		# uplink), and on this board netifd never puts eth0 into it:
++		# bridge_add_member() -> device_get("eth0", true) yields nothing,
++		# a freshly created test bridge stays empty as well, while the same
++		# thing done with "ip link set eth0 master ..." works instantly.
++		# With the wan unusable the box boots with no address at all, so
++		# the wan is left as the bare port (proven reliable) and the
++		# wireless AP lives on the lan bridge instead.
++
++		# NOTE: pass a *placeholder* port here, never "br-lan".  The lan
++		# entry is special-cased in bin/config_generate:
++		#   [ "$1" = "lan" -a -z "$ports" ] && ports="$device"
++		# so it builds "config device br-lan { ports <device> }".  Passing
++		# br-lan itself yields a bridge whose only port is br-lan, netifd
++		# cannot bring it up, and the wireless (which hostapd attaches to
++		# br-lan) comes up nowhere either - the box then boots with no
++		# ethernet, no address and no SSID.  eth1 does not exist on this
++		# board; 95-panther-brlan turns the generated br-lan into an empty
++		# bridge (bridge_empty=1, ports removed) right afterwards, which is
++		# what the wireless AP needs as its L2 home.
++		ucidef_set_interface_lan 'eth1'
++
++		# Open the wan zone, because this script is the only place that is
++		# *known* to run for this board (it is what writes the network
++		# config below) - an uci-defaults file proved not to be enough, and
++		# getting locked out of a headless single-port box means a maskrom
++		# reflash.
++		uci -q set firewall.@defaults[0].input='ACCEPT'
++		uci -q set firewall.@defaults[0].forward='ACCEPT'
++		uci -q set firewall.@zone[1].input='ACCEPT'
++		uci -q set firewall.@zone[1].forward='ACCEPT'
++		uci -q set firewall.@zone[1].output='ACCEPT'
++		uci -q commit firewall
++
++		# Note: a static address on the dhcp wan (list ipaddr) is *not*
++		# applied by netifd, so there is no fixed fallback address here; the
++		# port carries the upstream lease only.
++		;;
++	jp-tvbox,rk3566)
++		# Single Gigabit port (SoC GMAC1 with an RGMII PHY, MDIO address
++		# 1).  Same arrangement as panther,x2 and for the same reason: the
++		# port is the uplink and takes a lease, while the wireless AP is
++		# attached to a "lan" bridge that has no physical member (this box
++		# has no second port and no SD slot).  The firewall is opened for
++		# the wan zone as well, so the freshly flashed box is reachable at
++		# the address it leased; the full rationale for each step is in the
++		# panther,x2 block above.
++		ucidef_set_interface_wan 'eth0' 'dhcp'
++		# Placeholder port (see the long note in the panther,x2 block):
++		# config_generate turns "lan" + device into "config device br-lan
++		# { ports <device> }", so it must not be "br-lan" itself, and it
++		# must not be empty either - with no device the lan interface is
++		# not generated at all, dnsmasq then has no dhcp-range and every
++		# wireless client is left without an address.
++		ucidef_set_interface_lan 'eth1'
++
++		uci -q set firewall.@defaults[0].input='ACCEPT'
++		uci -q set firewall.@defaults[0].forward='ACCEPT'
++		uci -q set firewall.@zone[1].input='ACCEPT'
++		uci -q set firewall.@zone[1].forward='ACCEPT'
++		uci -q set firewall.@zone[1].output='ACCEPT'
++		uci -q commit firewall
++		;;
+ 	*)
+ 		ucidef_set_interface_lan 'eth0'
+ 		;;
+@@ -24,6 +104,61 @@ nanopi_r2s_generate_mac()
+ 	echo "$(macaddr_unsetbit_mc "$(macaddr_setbit_la "${mac_base}")")"
+ }
+ 
++panther_x2_generate_mac()
++{
++	# Stable per-board MAC derived from the onboard eMMC CID, falling back
++	# to the SD card CID and finally to the SoC serial.  The optional tag
++	# mixes in a per-interface string so one board can derive several
++	# *distinct* stable addresses.
++	#
++	# The CID is looked up in both mmc numbering schemes on purpose: on
++	# panther,x2 the eMMC is mmc1 (/dev/mmcblk1), on jp_tv it is mmc0
++	# (/dev/mmcblk0), and the DT alias decides which one it is.
++	local tag="$1" seed="" f
++	for f in /sys/class/mmc_host/mmc1/mmc1:*/cid \
++		 /sys/block/mmcblk1/device/cid \
++		 /sys/class/mmc_host/mmc0/mmc0:*/cid \
++		 /sys/block/mmcblk0/device/cid \
++		 /proc/device-tree/serial-number; do
++		[ -r "$f" ] || continue
++		seed=$(cat "$f" 2>/dev/null)
++		[ -n "$seed" ] && break
++	done
++	[ -z "$seed" ] && seed="$(board_name)"
++
++	local hash=$(printf '%s-%s' "$seed" "$tag" | sha256sum | cut -c1-12)
++	local mac_base=$(macaddr_canonicalize "$hash")
++	[ -z "$mac_base" ] && mac_base="02:00:00:00:00:01"
++
++	echo "$(macaddr_unsetbit_mc "$(macaddr_setbit_la "${mac_base}")")"
++}
++
++h28k_generate_mac()
++{
++	# Stable per-box MAC derived from the onboard eMMC CID (mmc1 in the DT
++	# aliases, i.e. /dev/mmcblk1 on this board), falling back to the SD
++	# card and finally to the SoC serial if no CID is readable yet.  The
++	# optional tag mixes in a per-interface string so one board can derive
++	# several *distinct* stable addresses.
++	local tag="$1" seed="" f
++	for f in /sys/class/mmc_host/mmc1/mmc1:*/cid \
++		 /sys/block/mmcblk1/device/cid \
++		 /sys/class/mmc_host/mmc0/mmc0:*/cid \
++		 /sys/block/mmcblk0/device/cid \
++		 /proc/device-tree/serial-number; do
++		[ -r "$f" ] || continue
++		seed=$(cat "$f" 2>/dev/null)
++		[ -n "$seed" ] && break
++	done
++	[ -z "$seed" ] && seed="hinlink-opc-h28k"
++
++	local hash=$(printf '%s-%s' "$seed" "$tag" | sha256sum | cut -c1-12)
++	local mac_base=$(macaddr_canonicalize "$hash")
++	[ -z "$mac_base" ] && mac_base="02:00:00:00:00:01"
++
++	echo "$(macaddr_unsetbit_mc "$(macaddr_setbit_la "${mac_base}")")"
++}
++
+ rockchip_setup_macs()
+ {
+ 	local board="$1"
+@@ -32,10 +167,33 @@ rockchip_setup_macs()
+ 	local label_mac=""
+ 
+ 	case "$board" in
++	panther,x2)
++		# See the note in the h28k case below: a single address must not
++		# be shared between an interface and its members, so set it per
++		# network device.
++		ucidef_set_network_device_mac eth0 "$(panther_x2_generate_mac lan)"
++		;;
++	jp-tvbox,rk3566)
++		# Same eMMC-CID derived address as panther,x2; no vendor
++		# ethernet-MAC is stored anywhere readable on this box.
++		ucidef_set_network_device_mac eth0 "$(panther_x2_generate_mac lan)"
++		;;
+ 	friendlyarm,nanopi-r2s)
+ 		wan_mac=$(nanopi_r2s_generate_mac)
+ 		lan_mac=$(macaddr_add "$wan_mac" +1)
+ 		;;
++	hinlink,opc-h28k)
++		# One stable MAC per *port* (same idea as target/linux/realtek).
++		#
++		# Note we must NOT use ucidef_set_interface_macaddr "lan" here: while
++		# both ports sit in the LAN bridge, generate_network() in
++		# bin/config_generate copies that single address onto the bridge AND
++		# onto every member port, and a bridge sharing its address with its
++		# members drops frames - DHCP replies included - so the board looks
++		# perfectly healthy while no client ever gets a lease.
++		ucidef_set_network_device_mac eth0 "$(h28k_generate_mac lan)"
++		ucidef_set_network_device_mac eth1 "$(h28k_generate_mac wan)"
++		;;
+ 	esac
+ 
+ 	[ -n "$lan_mac" ] && ucidef_set_interface_macaddr "lan" $lan_mac
+diff --git a/target/linux/rockchip/armv8/base-files/lib/upgrade/platform.sh b/target/linux/rockchip/armv8/base-files/lib/upgrade/platform.sh
+deleted file mode 100644
+index faed0667..00000000
+--- a/target/linux/rockchip/armv8/base-files/lib/upgrade/platform.sh
++++ /dev/null
+@@ -1,86 +0,0 @@
+-platform_check_image() {
+-	local diskdev partdev diff
+-
+-	export_bootdevice && export_partdevice diskdev 0 || {
+-		echo "Unable to determine upgrade device"
+-		return 1
+-	}
+-
+-	get_partitions "/dev/$diskdev" bootdisk
+-
+-	#extract the boot sector from the image
+-	get_image "$@" | dd of=/tmp/image.bs count=1 bs=512b 2>/dev/null
+-
+-	get_partitions /tmp/image.bs image
+-
+-	#compare tables
+-	diff="$(grep -F -x -v -f /tmp/partmap.bootdisk /tmp/partmap.image)"
+-
+-	rm -f /tmp/image.bs /tmp/partmap.bootdisk /tmp/partmap.image
+-
+-	if [ -n "$diff" ]; then
+-		echo "Partition layout has changed. Full image will be written."
+-		ask_bool 0 "Abort" && exit 1
+-		return 0
+-	fi
+-}
+-
+-platform_copy_config() {
+-	local partdev
+-
+-	if export_partdevice partdev 1; then
+-		mount -o rw,noatime "/dev/$partdev" /mnt
+-		cp -af "$UPGRADE_BACKUP" "/mnt/$BACKUP_FILE"
+-		umount /mnt
+-	fi
+-}
+-
+-platform_do_upgrade() {
+-	local diskdev partdev diff
+-
+-	export_bootdevice && export_partdevice diskdev 0 || {
+-		echo "Unable to determine upgrade device"
+-		return 1
+-	}
+-
+-	sync
+-
+-	if [ "$UPGRADE_OPT_SAVE_PARTITIONS" = "1" ]; then
+-		get_partitions "/dev/$diskdev" bootdisk
+-
+-		#extract the boot sector from the image
+-		get_image "$@" | dd of=/tmp/image.bs count=1 bs=512b
+-
+-		get_partitions /tmp/image.bs image
+-
+-		#compare tables
+-		diff="$(grep -F -x -v -f /tmp/partmap.bootdisk /tmp/partmap.image)"
+-	else
+-		diff=1
+-	fi
+-
+-	if [ -n "$diff" ]; then
+-		get_image "$@" | dd of="/dev/$diskdev" bs=4096 conv=fsync
+-
+-		# Separate removal and addtion is necessary; otherwise, partition 1
+-		# will be missing if it overlaps with the old partition 2
+-		partx -d - "/dev/$diskdev"
+-		partx -a - "/dev/$diskdev"
+-
+-		return 0
+-	fi
+-
+-	#iterate over each partition from the image and write it to the boot disk
+-	while read part start size; do
+-		if export_partdevice partdev $part; then
+-			echo "Writing image to /dev/$partdev..."
+-			get_image "$@" | dd of="/dev/$partdev" ibs="512" obs=1M skip="$start" count="$size" conv=fsync
+-		else
+-			echo "Unable to find partition $part device, skipped."
+-		fi
+-	done < /tmp/partmap.image
+-
+-	#copy partition uuid
+-	echo "Writing new UUID to /dev/$diskdev..."
+-	get_image "$@" | dd of="/dev/$diskdev" bs=1 skip=440 count=4 seek=440 conv=fsync
+-}
+diff --git a/target/linux/rockchip/armv8/config-5.4 b/target/linux/rockchip/armv8/config-5.4
+index 1627fb6f..35bcffdc 100644
+--- a/target/linux/rockchip/armv8/config-5.4
++++ b/target/linux/rockchip/armv8/config-5.4
+@@ -6,6 +6,7 @@ CONFIG_ARCH_HIBERNATION_POSSIBLE=y
+ CONFIG_ARCH_MMAP_RND_BITS_MAX=33
+ CONFIG_ARCH_MMAP_RND_COMPAT_BITS=11
+ CONFIG_ARCH_ROCKCHIP=y
++CONFIG_CPU_RK3568=y
+ CONFIG_ARCH_WANT_COMPAT_IPC_PARSE_VERSION=y
+ CONFIG_ARC_EMAC_CORE=y
+ CONFIG_ARM64_CNP=y
+@@ -277,6 +278,7 @@ CONFIG_NOP_USB_XCEIV=y
+ CONFIG_NO_HZ_COMMON=y
+ CONFIG_NO_HZ_IDLE=y
+ CONFIG_NVMEM=y
++CONFIG_NVMEM_ROCKCHIP_OTP=y
+ CONFIG_NVMEM_SYSFS=y
+ CONFIG_NVME_CORE=y
+ # CONFIG_NVME_MULTIPATH is not set
+@@ -380,6 +382,20 @@ CONFIG_ROCKCHIP_GRF=y
+ CONFIG_ROCKCHIP_IODOMAIN=y
+ CONFIG_ROCKCHIP_IOMMU=y
+ CONFIG_ROCKCHIP_MBOX=y
++# Rockchip vendor video codec (MPP) stack.  Every symbol is tristate (=m) and
++# the whole stack links into the single module rk_vcodec.ko, which is packaged
++# as kmod-rk-vcodec (target/linux/rockchip/modules.mk) and installed only by
++# the devices that list it in DEVICE_PACKAGES (panther_x2).  The remaining
++# rockchip boards build the module from this shared subtarget config but never
++# install or load it, so MPP is device-isolated without a per-device config.
++CONFIG_ROCKCHIP_MPP_SERVICE=m
++# CONFIG_ROCKCHIP_MPP_DEVFREQ is not set
++CONFIG_ROCKCHIP_MPP_PROC_FS=m
++CONFIG_ROCKCHIP_MPP_RKVDEC2=m
++CONFIG_ROCKCHIP_MPP_RKVENC=m
++CONFIG_ROCKCHIP_MPP_VDPU2=m
++CONFIG_ROCKCHIP_MPP_VEPU2=m
++CONFIG_ROCKCHIP_MPP_JPGDEC=m
+ CONFIG_ROCKCHIP_PHY=y
+ CONFIG_ROCKCHIP_PM_DOMAINS=y
+ # CONFIG_ROCKCHIP_SARADC is not set
+@@ -392,7 +408,7 @@ CONFIG_RTC_I2C_AND_SPI=y
+ CONFIG_RTC_NVMEM=y
+ # CONFIG_RUNTIME_TESTING_MENU is not set
+ CONFIG_SCHED_MC=y
+-CONFIG_SCSI=y
++CONFIG_SCSI=m
+ # CONFIG_SCSI_LOWLEVEL is not set
+ # CONFIG_SCSI_PROC_FS is not set
+ CONFIG_SCSI_SAS_ATTRS=y
+@@ -511,3 +527,138 @@ CONFIG_XZ_DEC_ARMTHUMB=y
+ CONFIG_XZ_DEC_BCJ=y
+ CONFIG_ZLIB_DEFLATE=y
+ CONFIG_ZLIB_INFLATE=y
++
++# RK3528 PCIe (2nd ethernet port: RTL8168 on PCIe)
++CONFIG_PCIE_DW_ROCKCHIP=y
++CONFIG_PHY_ROCKCHIP_NANENG_COMBO_PHY=y
++
++# RTL8168 gigabit NIC on PCIe (2nd physical port of OPC-H28K)
++# CONFIG_R8169 is not set
++CONFIG_LEDS_TRIGGER_HEARTBEAT=y
++CONFIG_LEDS_TRIGGER_NETDEV=y
++CONFIG_LEDS_TRIGGER_DEFAULT_ON=y
++CONFIG_LEDS_TRIGGER_TIMER=y
++CONFIG_PSTORE=y
++CONFIG_PSTORE_RAM=y
++CONFIG_PSTORE_CONSOLE=y
++CONFIG_PSTORE_PMSG=y
++CONFIG_PSTORE_DEFAULT_KMSG_SIZE=262144
++CONFIG_PSTORE_DEFLATE_COMPRESS=y
++CONFIG_PSTORE_DEFLATE_COMPRESS_DEFAULT=y
++# CONFIG_PSTORE_LZO_COMPRESS is not set
++# CONFIG_PSTORE_LZ4_COMPRESS is not set
++# CONFIG_PSTORE_LZ4HC_COMPRESS is not set
++# CONFIG_PSTORE_842_COMPRESS is not set
++# CONFIG_PSTORE_ZSTD_COMPRESS is not set
++
++# RK3566/RK3568 NPU (rknpu), back-ported from the vendor 5.10 driver.
++# DRM is required because the driver registers itself as a DRM render
++# node (/dev/dri/renderD*), which is what the RKNN userspace looks for.
++#
++# These symbols are global to the whole rockchip/armv8 subtarget and cannot be
++# made per-device: OpenWrt 21.02 has no per-device kernel config, and RKNPU has
++# to stay =y because the memory-manager choice at the bottom of this file is a
++# bool under "if ROCKCHIP_RKNPU" (a bool whose tristate parent is =m is
++# silently forced to =n, which would disable the DMA-heap path the RKNN
++# userspace uses).  They are nevertheless harmless on the other rockchip boards
++# that share this config:
++#
++#   * rknpu_of_match[] only lists rockchip,rknpu / rk3568-rknpu / rk3588-rknpu /
++#     rv1106 / rv1103b / rk3562 / rk3576.  None of rk3328, rk3399 or rk3528 has
++#     an rknpu DT node, so rknpu_probe() is never called there: the driver only
++#     registers a platform_driver at late_initcall and does nothing else (no
++#     clock/regulator/IRQ/IOMMU request, no /dev/rknpu, no misc device).
++#   * CONFIG_DRM=y is the generic DRM subsystem only (CONFIG_DRM_ROCKCHIP stays
++#     off); it has no SoC-specific side effect.
++#
++# The only cost on the other boards is a few tens of KB of unused vmlinux text.
++CONFIG_DRM=y
++CONFIG_DRM_VGEM=y
++CONFIG_ROCKCHIP_RKNPU=y
++# CONFIG_ROCKCHIP_RKNPU_DRM_GEM is not set
++CONFIG_ROCKCHIP_RKNPU_DEBUG_FS=y
++
++# The Panther X2's Bluetooth is a BCM43430A1 on UART and needs the BCM
++# protocol driver (btbcm) to upload brcm/BCM43430A1.hcd.  kmod-bluetooth
++# asks for HCIUART_BCM=n in its KCONFIG; whether the target config here
++# wins over that has to be confirmed by checking the generated .config.
++CONFIG_BT_HCIUART_BCM=y
++# NOTE: btbcm cannot be forced to =y here - it is only reachable through
++# selects from BT_HCIUART/BT_HCIBTUSB, which are modules, so kconfig keeps
++# it at =m.  btbcm.ko is therefore packaged by the small kmod-btbcm
++# package in package/kernel/btbcm (selected by the panther_x2 device),
++# which is what makes kmod-bluetooth's hci_uart.ko dependency resolve.
++
++# The BCM43430A1 Bluetooth is on UART and its DT node is
++# "brcm,bcm43438-bt", which only hci_bcm.c matches - so HCIUART_BCM has to
++# be on.  That makes hci_uart link against the btbcm helper, and btbcm can
++# only ever be a *module* here (it is pulled in by selects from BT_HCIUART/
++# BT_HCIBTUSB), which would leave hci_uart.ko with a dependency that
++# kmod-bluetooth does not ship.  Building the BT core and the UART/BCM code
++# into the kernel instead keeps module dependencies empty and still uploads
++# brcm/BCM43430A1.hcd at probe time.  USB Bluetooth dongles are not needed
++# on this board (no USB host at all), hence BT_HCIBTUSB=n.
++CONFIG_BT=y
++CONFIG_BT_BCM=y
++CONFIG_BT_HCIUART=y
++CONFIG_BT_HCIUART_BCM=y
++CONFIG_BT_HCIBTUSB=n
++
++# With the Bluetooth stack built in, hci_bcm probes long before the
++# squashfs root is mounted, so the request_firmware() lookup of
++# brcm/BCM43430A1.hcd fails ("Patch not found") even though the file
++# ships in /lib/firmware.  Embedding it in the kernel image fixes that;
++# the directory is relative to the kernel build tree (target files/ is
++# copied to its root by the kernel prepare step).
++CONFIG_EXTRA_FIRMWARE="brcm/BCM43430A1.hcd"
++CONFIG_EXTRA_FIRMWARE_DIR="firmware"
++
++# Debugging aids kept in the image on purpose: /dev/mem lets us read the
++# USBGRF/PHY registers directly (the USB port stops detecting re-connects),
++# and dynamic debug gives per-driver traces without rebuilding.
++CONFIG_DYNAMIC_DEBUG=y
++# CONFIG_STRICT_DEVMEM is not set
++# Vendor + mainline dma-buf heaps backing the NPU memory path.
++#
++# These are global to the subtarget for the same reason as the rknpu symbols
++# above: ROCKCHIP_RKNPU_DMA_HEAP is a bool that depends on
++# DMABUF_HEAPS_ROCKCHIP_CMA_HEAP, so the vendor CMA heap has to be built in
++# (=y) as well, and the mainline DMABUF_HEAPS framework is itself a bool.
++# None of this runs on a board whose DT has no rknpu node, and none of it
++# allocates memory at init:
++#   * rk_dma_heap_init() only allocates a chardev region, creates a class and a
++#     procfs directory; rk_cma_heap_init() only registers the "rk-dma-heap-cma"
++#     heap and bails out cleanly (-ENODEV, no crash) if no CMA area exists.
++#   * the mainline system heap only registers /dev/dma_heap/system; it reserves
++#     nothing until a process opens the chardev.
++# So rk3328/rk3399/rk3528 only gain a few extra chardev nodes, with no change
++# in behaviour.
++CONFIG_ROCKCHIP_RKNPU_DMA_HEAP=y
++CONFIG_DMABUF_HEAPS_ROCKCHIP=y
++CONFIG_DMABUF_HEAPS_ROCKCHIP_CMA_HEAP=y
++CONFIG_DMABUF_HEAPS_ROCKCHIP_CMA_ALIGNMENT=8
++# Mainline (upstream) DMA-BUF heaps framework + system heap, backported from
++# the vendor develop-5.10 tree.  Built-in (=y) so that /dev/dma_heap/system
++# exists before the RKNN userspace runtime starts.
++CONFIG_DMABUF_HEAPS=y
++CONFIG_DMABUF_HEAPS_DEFERRED_FREE=y
++CONFIG_DMABUF_HEAPS_PAGE_POOL=y
++CONFIG_DMABUF_HEAPS_SYSTEM=y
++CONFIG_ROCKCHIP_MULTI_RGA=y
++CONFIG_ROCKCHIP_RGA_ASYNC=y
++CONFIG_ROCKCHIP_RGA_PROC_FS=y
++# CONFIG_ROCKCHIP_RGA_DEBUG_FS is not set
++CONFIG_ROCKCHIP_RGA_GENPOOL=y
++CONFIG_ROCKCHIP_RGA_CMD_BUF_COUNT=32
++# CONFIG_DMABUF_RK_HEAPS_DEBUG is not set
++# CONFIG_DMABUF_RK_HEAPS_DEBUG_PRINT is not set
++CONFIG_ROCKCHIP_RKNPU_PROC_FS=y
++CONFIG_ROCKCHIP_RKNPU_FENCE=y
++
++# This tree's wireless Kconfig already carries the "Vendor: ..." grouping menus
++# (backported from 5.10), so the Broadcom vendor symbol has to be enabled or
++# drivers/net/wireless/broadcom/* - including brcmfmac - is not even visible
++# and kmod-brcmfmac cannot set CONFIG_BRCMFMAC at all.  It is a visibility bool
++# with no runtime effect: drivers are still only built when their own symbol is
++# selected by a kmod, so the sibling boards are unaffected.
++CONFIG_WLAN_VENDOR_BROADCOM=y
+diff --git a/target/linux/rockchip/armv8/target.mk b/target/linux/rockchip/armv8/target.mk
+index a5e60a61..33aed6e3 100644
+--- a/target/linux/rockchip/armv8/target.mk
++++ b/target/linux/rockchip/armv8/target.mk
+@@ -1,8 +1,9 @@
+ ARCH:=aarch64
+ SUBTARGET:=armv8
+-BOARDNAME:=RK33xx boards (64 bit)
++BOARDNAME:=RK33xx/RK35xx boards (64 bit)
++CPU_TYPE:=cortex-a53
+ 
+ define Target/Description
+-	Build firmware image for Rockchip RK33xx devices.
++	Build firmware image for Rockchip RK33xx/RK35xx devices.
+ 	This firmware features a 64 bit kernel.
+ endef
+diff --git a/target/linux/rockchip/image/armv8.mk b/target/linux/rockchip/image/armv8.mk
+index 24b1c381..b736cbae 100644
+--- a/target/linux/rockchip/image/armv8.mk
++++ b/target/linux/rockchip/image/armv8.mk
+@@ -30,3 +30,72 @@ define Device/radxa_rock-pi-4
+   IMAGE/sysupgrade.img.gz := boot-common | boot-script | pine64-img | gzip | append-metadata
+ endef
+ TARGET_DEVICES += radxa_rock-pi-4
++
++# RK3566 (Panther X2): boot chain is TPL/ATF from rkbin + U-Boot 2026.07, see
++# package/boot/uboot-rockchip-rk356x and package/boot/rockchip-rkbin.
++# U-Boot comes from the upstream "generic-rk3568" target: its DT explicitly
++# covers RK3566/RK3568 with eMMC, SD-card and serial2 at 1500000n8, which is
++# what this board uses for its console.
++define Device/panther_x2
++  DEVICE_VENDOR := Panther
++  DEVICE_MODEL := X2
++  DEVICE_DTS := rockchip/rk3566-panther-x2
++  SUPPORTED_DEVICES := panther,x2
++  SOC := rk3566
++  UBOOT_DEVICE_NAME := generic-rk3568
++  IMAGE/sysupgrade.img.gz := boot-common | boot-script | pine64-img | gzip | append-metadata
++  DEVICE_PACKAGES := e2fsprogs mkf2fs fdisk cfdisk partx-utils block-mount \
++    parted resize2fs losetup f2fsck \
++    dosfstools kmod-fs-vfat kmod-fs-msdos kmod-fs-ext4 \
++    kmod-nls-cp437 kmod-nls-utf8 \
++    ntfs-3g kmod-fuse \
++    kmod-usb-storage kmod-usb-storage-uas kmod-usb-storage-extras \
++    kmod-usb-net-rtl8152 \
++    kmod-brcmfmac cypress-firmware-43430-sdio wpad-basic-wolfssl iw kmod-bluetooth \
++    kmod-rk-vcodec \
++    luci-app-vputrans luci-app-rk356x-ocr luci-app-rk356x-yolov5n panel-ap-setup sht2x -urngd
++endef
++TARGET_DEVICES += panther_x2
++
++# RK3566 (JP TV Box 3566): same boot chain as the Panther X2 (TPL/ATF from
++# rkbin + U-Boot generic-rk3568, serial2 at 1500000n8).  The board has no SD
++# slot at all: the eMMC is mmc0 (/dev/mmcblk0) and is the only boot medium.
++# The wifi/bluetooth combo is a BCM43438-class module on SDIO/UART, i.e. the
++# same firmware blobs the Panther X2 vendors.
++define Device/jp_tv
++  DEVICE_VENDOR := JP
++  DEVICE_MODEL := TV Box 3566
++  DEVICE_DTS := rockchip/rk3566-jp-tvbox
++  SUPPORTED_DEVICES := jp-tvbox,rk3566
++  SOC := rk3566
++  UBOOT_DEVICE_NAME := generic-rk3568
++  IMAGE/sysupgrade.img.gz := boot-common | boot-script | pine64-img | gzip | append-metadata
++  DEVICE_PACKAGES := e2fsprogs mkf2fs fdisk cfdisk partx-utils block-mount \
++    parted resize2fs losetup f2fsck \
++    dosfstools kmod-fs-vfat kmod-fs-msdos kmod-fs-ext4 \
++    kmod-nls-cp437 kmod-nls-utf8 \
++    ntfs-3g kmod-fuse \
++    kmod-usb-storage kmod-usb-storage-uas kmod-usb-storage-extras \
++    kmod-brcmfmac brcmfmac-nvram-jp-tv \
++    wpad-basic-wolfssl iw kmod-bluetooth \
++    kmod-rk-vcodec kmod-rk-spdif kmod-rk-simple-card kmod-rk-i2s \
++    kmod-rk-ahci kmod-openvfd openvfd -urngd
++endef
++TARGET_DEVICES += jp_tv
++
++# RK3528 (HINLINK OPC-H28K): boot chain is TPL/ATF from rkbin + U-Boot 2026.07,
++# see package/boot/uboot-rockchip-rk3528 and package/boot/rockchip-rkbin.
++define Device/hinlink_opc-h28k
++  DEVICE_VENDOR := HINLINK
++  DEVICE_MODEL := OPC-H28K
++  SOC := rk3528
++  DEVICE_DTS := rockchip/rk3528-opc-h28k
++  UBOOT_DEVICE_NAME := generic-rk3528
++  IMAGE/sysupgrade.img.gz := boot-common | boot-script | pine64-img | gzip | append-metadata
++  DEVICE_PACKAGES := kmod-r8168 e2fsprogs mkf2fs \
++    fdisk cfdisk partx-utils block-mount parted resize2fs losetup f2fsck dosfstools \
++    kmod-fs-vfat kmod-fs-msdos kmod-nls-cp437 kmod-nls-utf8 \
++    ntfs-3g kmod-fuse luci-app-rk356x-ocr \
++    kmod-usb-storage kmod-usb-storage-uas kmod-usb-storage-extras -urngd
++endef
++TARGET_DEVICES += hinlink_opc-h28k
+diff --git a/target/linux/rockchip/image/mmc.bootscript b/target/linux/rockchip/image/mmc.bootscript
+index b70a62c4..5def1b2a 100644
+--- a/target/linux/rockchip/image/mmc.bootscript
++++ b/target/linux/rockchip/image/mmc.bootscript
+@@ -1,8 +1,198 @@
+ part uuid mmc ${devnum}:2 uuid
++# Fall back to the known PARTUUID if U-Boot could not derive one (a bad or
++# missing ${devnum} leaves it empty, which makes the kernel look for
++# "PARTUUID=-02" and panic before userspace ever runs).  A marker file records
++# which branch was taken: 'K' = uuid was fine, 'E' = we had to substitute it.
++if test "${uuid}" = ""; then
++	setenv uuid 5452574f-02
++	mw.b 0x03000000 0x45
++else
++	mw.b 0x03000000 0x4B
++fi
++ext4write mmc 0:1 0x03000000 /uuid-state.bin 0x40 || echo skip
++# Read the first sector of the rootfs partition (sector 0x20000 = 64 MiB) and
++# compare its magic against "hsqs" (little-endian 0x68737173).  Marker file
++# /rootfs-magic.bin: 'G' = the squashfs really is on the flash and readable,
++# 'B' = that sector is not a squashfs superblock.
++mmc read 0x03000100 0x20000 0x1 || echo skip
++if itest.l *0x03000100 == 0x73716873; then
++	mw.b 0x03000200 0x47
++else
++	mw.b 0x03000200 0x42
++fi
++ext4write mmc 0:1 0x03000200 /rootfs-magic.bin 0x40 || echo skip
++# The overlay lives right after the squashfs inside the same partition, and
++# ONLY fstools (i.e. userspace) ever formats it.  So reading that area tells us
++# whether userspace ran at all: offset 9850880 bytes into the rootfs partition
++# = sector 131072 + 19240 = 150312, and the fs magic sits at +0x438.
++mmc read 0x03000300 0x24b28 0x2 || echo skip
++ext4write mmc 0:1 0x03000300 /overlay-probe.bin 0x400 || echo skip
++# Copy the pstore/ramoops window (reserved DRAM @240 MiB) into the boot
++# partition.  If the kernel panicked, this is where its console log landed and
++# it is the only way to read it on a board with no UART and no userspace.
++# Two names because ext4write refuses to overwrite: the first boot after a
++# flash writes kernel-log.bin, the boot after a panic writes kernel-log2.bin.
++cp.b 0x0f000000 0x04000000 0x40000 || echo skip
++if load mmc 0:1 0x05000000 /kernel-log.bin; then
++	ext4write mmc 0:1 0x04000000 /kernel-log2.bin 0x40000 || echo skip
++else
++	ext4write mmc 0:1 0x04000000 /kernel-log.bin 0x40000 || echo skip
++fi
+ 
+-setenv bootargs "console=ttyS2,1500000 console=tty1 earlycon=uart8250,mmio32,0xff1a0000 root=PARTUUID=${uuid} rw rootwait"
++if test $soc = 'rk3308'; then
++	serial_addr=',0xff0c0000'; serial_port='ttyS2';
++elif test $soc = 'rk3328'; then
++	serial_addr=',0xff130000'; serial_port='ttyS2';
++elif test $soc = 'rk3399'; then
++	serial_addr=',0xff1a0000'; serial_port='ttyS2';
++elif test $soc = 'rk3528'; then
++	serial_addr=',0xff9f0000'; serial_port='ttyS0';
++elif test $soc = 'rk3566'; then
++	serial_addr=',0xfe660000'; serial_port='ttyS2';
++elif test $soc = 'rk3568'; then
++	serial_addr=',0xfe660000'; serial_port='ttyS2';
++elif test $soc = 'rk3576'; then
++	serial_addr=',0x2ad40000'; serial_port='ttyS0';
++elif test $soc = 'rk3588'; then
++	serial_addr=',0xfeb50000'; serial_port='ttyS2';
++fi
+ 
+-load mmc ${devnum}:1 ${fdt_addr_r} rockchip.dtb
+-load mmc ${devnum}:1 ${kernel_addr_r} kernel.img
++# Two contiguous pools on the video boards:
++#
++#   cma=256M         the default CMA area - shared with everything else on the
++#                    box (RGA, network, other programs).  One 4K NV12 frame is
++#                    12.4 MB and MPP keeps 20+ of them, so a 4K stream needs
++#                    ~300 MB and this area alone cannot hold it reliably.
++#   rk_video_cma=512M  a dedicated area (patches-5.4/329) exposed as
++#                    /dev/dma_heap/{cma,cma-uncached}; libmpp prefers those
++#                    heaps, so the VPU works out of its own pool and other
++#                    programs cannot fragment it.  Without the parameter the
++#                    heaps fall back to the default area (old behaviour).
++#
++# Older/smaller SoCs keep the single 128M area.
++if test $soc = 'rk3566'; then
++	setenv cma_size '512M';
++	setenv video_cma 'rk_video_cma=512M';
++elif test $soc = 'rk3568'; then
++	setenv cma_size '512M';
++	setenv video_cma 'rk_video_cma=512M';
++elif test $soc = 'rk3588'; then
++	setenv cma_size '256M';
++	setenv video_cma 'rk_video_cma=512M';
++else
++	setenv cma_size '128M';
++	setenv video_cma '';
++fi
++setenv bootargs "console=${serial_port},1500000 earlycon=uart8250,mmio32${serial_addr} root=PARTUUID=${uuid} rw rootwait panic=5 iomem=relaxed cma=${cma_size} ${video_cma} r8168.aspm=0 r8168.dynamic_aspm=0 r8168.eee_enable=0 pcie_aspm=off"
++
++if test $soc = 'rk3528'; then
++	# Boot-stage breadcrumbs for a board with no exposed UART.
++	#   1) three quick flashes of green:work (gpio4 PB7, active low, gpio 143)
++	#      right at power-on mean U-Boot ran this script.
++	#   2) marker files in the ext4 boot partition record how far it got:
++	#        uboot-ran.bin        boot script reached this point
++	#        uboot-booti.bin      kernel and DTB loaded, handing over
++	#        uboot-ERR-dtb.bin    the DTB load failed
++	#        uboot-ERR-kernel.bin the kernel load failed
++	# Every command is guarded with "|| echo skip" so that a failure in here can
++	# never abort the boot script.  The scratch address is always one the
++	# following load overwrites (or, for the error markers, one that no longer
++	# matters), so nothing gets corrupted.
++	#
++	# NOTE: remove this block once the board is known good.
++	# --- hardware probe (PLAN B): runs entirely inside U-Boot ---
++	# 1) drive the amber LED (gpio4 pin 17) straight through the v2 registers.
++	#    Pin 17 cannot be expressed in the old v1 layout at all, so if the LED
++	#    lights, the v2 layout is confirmed at the hardware level.
++	mw.l 0xffb2000c 0x00020002 || echo skip
++	mw.l 0xffb20004 0x00000002 || echo skip
++	sleep 3 || echo skip
++	# 2) Raw sector forensics.  U-Boot cannot read squashfs, so "load failed"
++	#    would prove nothing.  Instead copy the raw blocks to the boot
++	#    partition and inspect them on the host:
++	#      mbr.bin        - the on-board partition table (did the flash land?)
++	#      rootfs-head.bin- first 32 KiB of the rootfs partition (expect "hsqs"
++	#                       magic = the squashfs really is there)
++	mmc read 0x03000000 0x0 0x1 || echo skip
++	ext4write mmc 0:1 0x03000000 /mbr.bin 0x200 || echo skip
++	mmc read 0x03000000 0x20000 0x40 || echo skip
++	ext4write mmc 0:1 0x03000000 /rootfs-head.bin 0x8000 || echo skip
++	mmc read 0x03100000 0x40 0x20 || echo skip
++	ext4write mmc 0:1 0x03100000 /uboot-head.bin 0x4000 || echo skip
++	# 3) snapshot the gpio3/gpio4 banks so we can see what the registers hold
++	#    before Linux touches them.
++	cp.b 0xffb20000 0x02000000 0x100 || echo skip
++	cp.b 0xffb10000 0x02000100 0x100 || echo skip
++	ext4write mmc 0:1 0x02000000 /ub-regs.bin 0x200 || echo skip
++# GMAC1 RGMII delay registers, read straight from the GRF with MMIO.
++# Doing this from Linux via the regmap debugfs file hangs (the rk3528 GRF
++# window is 0x90000 bytes and dumping every register is slow enough to wedge
++# the init script), so read just the two words here instead.
++#   0xff340018 = GRF + 0x40018 (CON5): delay enable bits
++#   0xff34001c = GRF + 0x4001c (CON6): TX delay in bits 7:0, RX delay in 15:8
++cp.b 0xff340018 0x02100000 0x8 || echo skip
++ext4write mmc 0:1 0x02100000 /gmac-delay.bin 0x8 || echo skip
++# Apply the GMAC1 RGMII delays ourselves.  Linux is supposed to do this in
++# rk3528_set_to_rgmii(), but the registers read back as all-zero afterwards, so
++# do it here (before the kernel starts) where it is known to stick.
++#   CON5 0xff340018: bit15 = RX clock delay enable, bit14 = TX clock delay enable
++#   CON6 0xff34001c: TX delay in bits 7:0 (0x36), RX delay in bits 15:8 (0x2d)
++# Rockchip GRF writes need the write-mask in the upper 16 bits.
++# CON5 also carries bit12 = GMAC1 clock source (0 = CRU/internal, 1 = IO pin) and
++# bit9 = RMII clock gate.  The vendor 5.10 glue sets both in
++# rk3528_set_clock_selection(); our 5.4 port has no such callback, so unless we
++# do it here nothing ever sets the clock source and the RGMII data path stays
++# dead while the link still negotiates perfectly.  clock_in_out = "output" on
++# this board, so: bit12 -> 0 (CRU), bit9 -> 0 (no gate).
++cp.b 0xff340018 0x02100008 0x8 || echo skip
++ext4write mmc 0:1 0x02100008 /gmac-delay-set.bin 0x8 || echo skip
++# Release the PHY reset line.  gpio4 pin 18 is the RTL8211F reset, wired
++# ACTIVE LOW, and it has been sitting at raw level 0 (= reset asserted) ever
++# since we started: debugfs reports "gpio-146 (|snps,reset) out lo ACTIVE LOW".
++# A PHY held in reset still answers MDIO (so it is detected and "Link is Up"
++# gets reported) but its 1000M path never comes up - exactly the green LED
++# staying dark.  On the new GPIO layout the data register for bits 16..31 is
++# at +0x04 with the write-mask in the upper half, so BIT(2)|BIT(18) sets pin 18 high.
++#   0xffb20004 = GPIO4 DR_H : mask BIT(18) | value BIT(2)
++mw.l 0xffb20004 0x00040004 || echo skip
++cp.b 0xffb20004 0x02100010 0x4 || echo skip
++ext4write mmc 0:1 0x02100010 /gpio4-dr.bin 0x4 || echo skip
++
++	gpio clear 143 || echo skip
++	sleep 1 || echo skip
++	gpio set 143 || echo skip
++	sleep 1 || echo skip
++	gpio clear 143 || echo skip
++	sleep 1 || echo skip
++	gpio set 143 || echo skip
++	sleep 1 || echo skip
++	gpio clear 143 || echo skip
++	sleep 1 || echo skip
++	gpio set 143 || echo skip
++	sleep 1 || echo skip
++
++	mw.b ${fdt_addr_r} 0x55 0x10 || echo skip
++	ext4write mmc ${devnum}:1 ${fdt_addr_r} /uboot-ran.bin 0x10 || echo skip
++
++	if load mmc ${devnum}:1 ${fdt_addr_r} rockchip.dtb; then
++		echo skip
++	else
++		mw.b ${kernel_addr_r} 0x11 0x10 || echo skip
++		ext4write mmc ${devnum}:1 ${kernel_addr_r} /uboot-ERR-dtb.bin 0x10 || echo skip
++	fi
++
++	mw.b ${kernel_addr_r} 0xaa 0x10 || echo skip
++	ext4write mmc ${devnum}:1 ${kernel_addr_r} /uboot-booti.bin 0x10 || echo skip
++
++	if load mmc ${devnum}:1 ${kernel_addr_r} kernel.img; then
++		echo skip
++	else
++		mw.b ${fdt_addr_r} 0x22 0x10 || echo skip
++		ext4write mmc ${devnum}:1 ${fdt_addr_r} /uboot-ERR-kernel.bin 0x10 || echo skip
++	fi
++else
++	load mmc ${devnum}:1 ${fdt_addr_r} rockchip.dtb
++	load mmc ${devnum}:1 ${kernel_addr_r} kernel.img
++fi
+ 
+ booti ${kernel_addr_r} - ${fdt_addr_r}
