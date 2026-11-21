@@ -962,9 +962,16 @@ int main(void) {
         int pct = (total > 0) ? (int)(done * 100.0 / total) : (ended ? 100 : 0);
         if (pct > 100) pct = 100;
         const char *state = ended ? "done" : (alive ? "running" : "stopped");
+        char src[512] = {0};
+        if ((q = strstr(jb, "\"src\":\""))) {
+            q += 7;
+            size_t i = 0;
+            while (*q && *q != '"' && i + 1 < sizeof(src)) src[i++] = *q++;
+            src[i] = 0;
+        }
         out_json("{\"ok\":1,\"pct\":%d,\"state\":\"%s\",\"done_sec\":%.1f,"
-                 "\"total_sec\":%.1f,\"size\":%lld,\"out\":\"%s\"}",
-                 pct, state, done, total, sz, out);
+                 "\"total_sec\":%.1f,\"size\":%lld,\"out\":\"%s\",\"src\":\"%s\"}",
+                 pct, state, done, total, sz, out, src);
         return 0;
     }
 

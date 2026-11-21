@@ -229,6 +229,7 @@ static int run_argv(argv_t *a, char *errbuf, size_t errcap) {
 }
 
 /* 前向声明：这些实现在后面的"增强部分"，但 op_portrait 要用到 */
+static double fps_of(const char *path);   /* 前向声明 */
 static double duration_of(const char *path);
 /* 跑 shell 管道（解码 | 重建 | 编码），返回退出码 */
 static int run_pipe_sync(const char *cmd) {
@@ -276,6 +277,8 @@ static int ff_has_filter(const char *bin, const char *name) {
 
 static int g_force_sw;
 static const char *g_cur_json;
+static char g_src_path[512];      /* 当前处理的源文件，用来在结果里带 "src"
+                                   * 前端据此同时显示"原片/处理后"两个播放器 */
 static const char *g_cur_kind = "video";      /* 任务种类 id */
 static const char *g_cur_label = "视频处理";    /* 给人看的名字 */   /* 当前 op 的入参 JSON，异步分支要用 */          /* 1 = 这个 op 只能用软件 ffmpeg */
 
@@ -418,8 +421,8 @@ static char *maybe_async(argv_t *a, const char *path, const char *out,
     snprintf(ans, sizeof(ans), "%s已开始（后台），完成后自动显示", label);
     snprintf(extra, sizeof(extra),
              "\"id\":\"%s\",\"pid\":%d,\"out\":\"%s\",\"async\":1,\"kind\":\"%s\","
-             "\"total_sec\":%.0f,\"format\":\"mp4\"",
-             id, pid, out, kind, total);
+             "\"total_sec\":%.0f,\"format\":\"mp4\",\"src\":\"%s\"",
+             id, pid, out, kind, total, g_src_path);
     return json_pair(text, ans, extra);
 }
 
@@ -998,6 +1001,24 @@ static double duration_of(const char *path) {
     return d;
 }
 
+/* 取帧率（r_frame_rate 形如 25/1） */
+static double fps_of(const char *path) {
+    char cmd[600], buf[128];
+    snprintf(cmd, sizeof(cmd),
+             "%s -v error -select_streams v:0 -show_entries stream=r_frame_rate "
+             "-of default=nw=1:nk=1 \"%s\" 2>/dev/null", fp_path(), path);
+    FILE *p = popen(cmd, "r");
+    if (!p) return 25.0;
+    double v = 25.0;
+    if (fgets(buf, sizeof(buf), p)) {
+        double num = 0, den = 1;
+        if (sscanf(buf, "%lf/%lf", &num, &den) == 2 && den > 0) v = num / den;
+        else if (sscanf(buf, "%lf", &num) == 1 && num > 0) v = num;
+    }
+    pclose(p);
+    return v > 0.1 ? v : 25.0;
+}
+
 /* 后台起 ffmpeg：不等待，stdout/stderr 丢 /dev/null，进度写 progfile */
 static int run_async(argv_t *a, const char *progfile) {
     pid_t pid = fork();
@@ -1020,8 +1041,9 @@ static void job_record(const char *id, int pid, const char *out, double total, c
     snprintf(p, sizeof(p), "%s/%s.json", VJOBS, id);
     FILE *f = fopen(p, "w");
     if (!f) return;
-    fprintf(f, "{\"id\":\"%s\",\"pid\":%d,\"out\":\"%s\",\"total\":%.2f,\"kind\":\"%s\",\"start\":%ld}\n",
-            id, pid, out, total, kind, (long)time(NULL));
+    fprintf(f, "{\"id\":\"%s\",\"pid\":%d,\"out\":\"%s\",\"total\":%.2f,\"kind\":\"%s\","
+               "\"start\":%ld,\"src\":\"%s\"}\n",
+            id, pid, out, total, kind, (long)time(NULL), g_src_path);
     fclose(f);
 }
 
@@ -2010,6 +2032,143 @@ static char *op_desub(const char *json) {
         return json_pair(text, ans, extra);
     }
     char vf[900];
+    /* npu：调板上 /opt/py/migan.sh（MI-GAN 6M 参数跑 RK3566 NPU，实测 1.97 秒/帧）。
+     * 比 CPU 上的 LaMa 快 5 倍；脚本自己会停 LLM 腾内存、跑完再恢复。 */
+    if (!strcmp(mode, "npu") || !strcmp(mode, "ai")) {
+        char text[700], ans[240], extra[480], cmd[900], id[64], prog[512], logf[512];
+        if (access("/opt/py/migan.sh", X_OK) != 0)
+            return errf("NPU 去字幕未安装（需要板上 /opt/py/migan.sh）%s%s", "", "");
+        /* 字幕带外扩：自动探测常常只圈到字心，描边/下沿会留下淡淡残影 */
+        int ny = (int)jget_int(json, "band_y", -1);
+        int nh = (int)jget_int(json, "band_h", -1);
+        if (ny >= 0 && nh > 0) {
+            y = ny; hh = nh;
+        } else {
+            y = y - 4;
+            if (y < 0) y = 0;
+            hh = hh + 12;
+            if (y + hh > sh) hh = sh - y;
+        }
+        double dur = duration_of(path);
+        double fps = fps_of(path);
+        if (fps <= 1) fps = 25;
+        int nfr = (int)(dur * fps + 0.5);
+        if (nfr < 1) nfr = 1;
+        snprintf(id, sizeof(id), "npu_%ld", (long)time(NULL));
+        mkdir("/tmp/llama_agent", 0777);   /* 重启后父目录不存在，不建的话下面全失败 */
+        mkdir(VJOBS, 0777);
+        snprintf(prog, sizeof(prog), "%s/%s.prog", VJOBS, id);
+        snprintf(logf, sizeof(logf), "%s/%s.log", VJOBS, id);
+        snprintf(cmd, sizeof(cmd),
+                 "MIGAN_PROG='%s' /opt/py/migan.sh '%s' '%s' --band-y %d --band-h %d",
+                 prog, path, out, y, hh);
+        int want_async = (int)jget_int(json, "async", 1);
+        if (want_async) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                setsid();
+                int fd = open(logf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd < 0) fd = open("/dev/null", O_WRONLY);
+                if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+                execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+                _exit(127);
+            }
+            if (pid < 0) return errf("启动 NPU 任务失败%s%s", "", "");
+            job_record(id, (int)pid, out, dur, "npu去字幕");
+            snprintf(text, sizeof(text),
+                     "**NPU 去字幕已开始（后台）**\n\n| 项 | 值 |\n|---|---|\n"
+                     "| 任务 ID | `%s` |\n| 字幕区域 | `x=0 y=%d w=%d h=%d` |\n"
+                     "| 引擎 | MI-GAN（RK3566 NPU，约 2 秒/帧） |\n"
+                     "| 帧数 | %d 帧（约 %.0f 分钟） |\n| 输出 | `%s` |\n",
+                     id, y, sw, hh, nfr, nfr * 2.0 / 60.0, out);
+            snprintf(ans, sizeof(ans),
+                     "NPU 去字幕已开始（%d 帧，约 %.0f 分钟），用 job 查进度", nfr, nfr * 2.0 / 60.0);
+            snprintf(extra, sizeof(extra),
+                     "\"id\":\"%s\",\"async\":1,\"pid\":%d,\"out\":\"%s\","
+                     "\"total_sec\":%.1f,\"kind\":\"npu去字幕\"",
+                     id, (int)pid, out, dur);
+            return json_pair(text, ans, extra);
+        }
+        int rc = run_pipe_sync(cmd);
+        if (rc != 0) return errf("NPU 去字幕失败（退出码 %d），见 %s%s", logf, "");
+        struct stat stn; stat(out, &stn);
+        snprintf(text, sizeof(text),
+                 "**NPU 去字幕完成**\n\n| 项 | 值 |\n|---|---|\n"
+                 "| 字幕区域 | `x=0 y=%d w=%d h=%d` |\n| 引擎 | MI-GAN（NPU） |\n"
+                 "| 文件 | `%s` |\n", y, sw, hh, out);
+        snprintf(ans, sizeof(ans), "NPU 去字幕完成，%.1f MB", stn.st_size / 1048576.0);
+        snprintf(extra, sizeof(extra),
+                 "\"path\":\"%s\",\"file\":\"%s\",\"format\":\"mp4\",\"size\":%ld",
+                 out, out, (long)stn.st_size);
+        return json_pair(text, ans, extra);
+    }
+    /* crop_extend：裁掉字幕带，底部用"最后几行镜像"补齐原高度。
+     * 比"拉伸回原尺寸"好：不产生纵向变形（实测拉 12% 人脸会变长）。 */
+    if (!strcmp(mode, "crop_extend") || !strcmp(mode, "extend")) {
+        char text[600], ans[240], extra[480];   /* 这几个是块内局部变量，别用外层的 */
+        int keep = y - 4;
+        if (keep < 40) keep = sh - (y + hh) - 4;
+        if (keep < 40) keep = sh * 3 / 4;
+        keep &= ~1;                                /* yuv420p 要求偶数高度，否则输出会少 2 行 */
+        int padh = sh - keep;
+        if (padh < 0) padh = 0;
+        if (padh > keep) padh = keep;              /* 镜像源不够就退化成拉伸 */
+        if (padh > 0)
+            snprintf(vf, sizeof(vf),
+                     "[0:v]split[a][b];[b]crop=%d:%d:0:%d,vflip[p];"
+                     "[a]crop=%d:%d:0:0[base];[base][p]vstack=inputs=2",
+                     sw, padh, keep - padh, sw, keep);
+        else
+            snprintf(vf, sizeof(vf), "crop=%d:%d:0:0,scale=%d:%d:flags=lanczos",
+                     sw, keep, sw, sh);
+        char *bad = encode_with(path, out, NULL, vf, NULL, NULL, 1);
+        if (bad) return bad;
+        struct stat st9;
+        stat(out, &st9);
+        snprintf(text, sizeof(text),
+                 "**已去字幕（crop_extend：裁掉底部 %d 像素，镜像补齐，不拉伸）**\n\n"
+                 "| 项 | 值 |\n|---|---|\n| 模式 | crop_extend |\n"
+                 "| 原尺寸 | %dx%d |\n| 输出 | %dx%d |\n| 文件 | `%s` |\n",
+                 sh - keep, sw, sh, sw, sh, out);
+        snprintf(ans, sizeof(ans), "已去字幕（裁掉 %d 像素，镜像补齐，无变形），%.1f MB",
+                 sh - keep, st9.st_size / 1048576.0);
+        snprintf(extra, sizeof(extra),
+                 "\"path\":\"%s\",\"file\":\"%s\",\"format\":\"mp4\",\"size\":%ld",
+                 out, out, (long)st9.st_size);
+        return json_pair(text, ans, extra);
+    }
+    /* fill：用字幕带"上方那一行"的平均色把整条带涂满。
+     * crop 会拉伸画面（位置全变），fill 不动任何原有像素位置，
+     * 适合 03.mp4 这种字幕压在纯色条上的片子 —— 涂完和没有字幕一模一样。 */
+    if (!strcmp(mode, "fill") || !strcmp(mode, "cover")) {
+        char text[600], ans[240], extra[480];
+        int sy = y - 2;
+        if (sy < 0) sy = 0;
+        if (sy >= sh) sy = sh - 1;
+        snprintf(vf, sizeof(vf),
+                 "[0:v]split[a][b];"
+                 /* 必须显式 yuv420p：overlay 的 format=auto 会产出 yuvj420p（pc 全范围），
+                  * 浏览器直接报 MEDIA_ERR_SRC_NOT_SUPPORTED（实测 err=4，画面全黑） */
+                 "[b]crop=%d:2:0:%d,scale=1:1:flags=area,scale=%d:%d:flags=neighbor,"
+                 "format=yuv420p[p];[a][p]overlay=0:%d:format=yuv420",
+                 sw, sy, sw, hh, y);
+        char *bad = encode_with(path, out, NULL, vf, NULL, NULL, 1);
+        if (bad) return bad;
+        struct stat st8;
+        stat(out, &st8);
+        snprintf(text, sizeof(text),
+                 "**去字幕完成（用背景色覆盖字幕带）**\n\n"
+                 "| 项 | 值 |\n|---|---|\n| 字幕区域 | `x=0 y=%d w=%d h=%d` |\n"
+                 "| 处理方式 | 取上方一行平均色涂满（画面位置不变、不拉伸） |\n"
+                 "| 分辨率 | %dx%d（原样） |\n| 文件 | `%s` |\n",
+                 y, sw, hh, sw, sh, out);
+        snprintf(ans, sizeof(ans), "已去字幕（背景色覆盖，画面位置不变），%.1f MB",
+                 st8.st_size / 1048576.0);
+        snprintf(extra, sizeof(extra),
+                 "\"path\":\"%s\",\"file\":\"%s\",\"format\":\"mp4\",\"size\":%ld",
+                 out, out, (long)st8.st_size);
+        return json_pair(text, ans, extra);
+    }
     if (!strcmp(mode, "crop")) {
         /* 直接切掉：画面会变矮，但绝对不会留痕迹 */
         /* 切掉字幕带后**拉伸回原尺寸**：动画片这么拉几乎看不出来，
@@ -2061,32 +2220,53 @@ static char *op_desub(const char *json) {
 }
 
 /* ---------------- 入口 ---------------- */
+
+/* 给结果 JSON 注入 "src":<源文件>，前端才能把原片和处理后的视频并排显示。
+ * 只对真正产出了 mp4 的结果生效（file+format:mp4 都在）。 */
+static char *with_src(char *res) {
+    if (!res || !g_src_path[0]) return res;
+    if (strstr(res, "\"src\":")) return res;
+    if (!strstr(res, "\"format\":\"mp4\"") || !strstr(res, "\"file\":")) return res;
+    const char *anchor = strstr(res, "\"format\":");
+    if (!anchor) return res;
+    size_t head = (size_t)(anchor - res);
+    size_t cap = strlen(res) + strlen(g_src_path) + 64;
+    char *out = malloc(cap);
+    if (!out) return res;
+    snprintf(out, cap, "%.*s\"src\":\"%s\",%s", (int)head, res, g_src_path, anchor);
+    free(res);
+    return out;
+}
+#define RET(x) do { char *r__ = (x); return with_src(r__); } while (0)
+
 static char *run(const char *json_in) {
     char op[32] = {0};
     g_cur_json = json_in;
+    g_src_path[0] = 0;
+    jget(json_in, "path", g_src_path, sizeof(g_src_path));
     jget(json_in, "op", op, sizeof(op));
     if (!op[0]) snprintf(op, sizeof(op), "info");
 
     if (!strcmp(op, "hw") || !strcmp(op, "caps")) return op_hw();
-    if (!strcmp(op, "info") || !strcmp(op, "probe") || !strcmp(op, "video_info") || !strcmp(op, "vinfo")) return op_info(json_in);
+    if (!strcmp(op, "info") || !strcmp(op, "probe") || !strcmp(op, "video_info") || !strcmp(op, "vinfo")) RET(op_info(json_in));
     if (!strcmp(op, "portrait") || !strcmp(op, "vertical") || !strcmp(op, "shupin"))
-        return op_portrait(json_in);
-    if (!strcmp(op, "effects") || !strcmp(op, "fx")) return op_effects(json_in);
-    if (!strcmp(op, "trim") || !strcmp(op, "clip")) return op_trim(json_in);
-    if (!strcmp(op, "thumb") || !strcmp(op, "frame")) return op_thumb(json_in);
-    if (!strcmp(op, "gif")) return op_gif(json_in);
-    if (!strcmp(op, "compress") || !strcmp(op, "small")) return op_compress(json_in);
-    if (!strcmp(op, "audio") || !strcmp(op, "extract_audio")) return op_audio(json_in);
-    if (!strcmp(op, "watermark") || !strcmp(op, "logo")) return op_watermark(json_in);
-    if (!strcmp(op, "crop") || !strcmp(op, "scale")) return op_crop_scale(json_in);
-    if (!strcmp(op, "concat") || !strcmp(op, "merge")) return op_concat(json_in);
-    if (!strcmp(op, "split") || !strcmp(op, "segment")) return op_split(json_in);
-    if (!strcmp(op, "sheet") || !strcmp(op, "preview")) return op_sheet(json_in);
-    if (!strcmp(op, "convert") || !strcmp(op, "remux")) return op_convert(json_in);
-    if (!strcmp(op, "detect") || !strcmp(op, "analyze")) return op_detect(json_in);
-    if (!strcmp(op, "job") || !strcmp(op, "progress")) return op_job(json_in);
+        RET(op_portrait(json_in));
+    if (!strcmp(op, "effects") || !strcmp(op, "fx")) RET(op_effects(json_in));
+    if (!strcmp(op, "trim") || !strcmp(op, "clip")) RET(op_trim(json_in));
+    if (!strcmp(op, "thumb") || !strcmp(op, "frame")) RET(op_thumb(json_in));
+    if (!strcmp(op, "gif")) RET(op_gif(json_in));
+    if (!strcmp(op, "compress") || !strcmp(op, "small")) RET(op_compress(json_in));
+    if (!strcmp(op, "audio") || !strcmp(op, "extract_audio")) RET(op_audio(json_in));
+    if (!strcmp(op, "watermark") || !strcmp(op, "logo")) RET(op_watermark(json_in));
+    if (!strcmp(op, "crop") || !strcmp(op, "scale")) RET(op_crop_scale(json_in));
+    if (!strcmp(op, "concat") || !strcmp(op, "merge")) RET(op_concat(json_in));
+    if (!strcmp(op, "split") || !strcmp(op, "segment")) RET(op_split(json_in));
+    if (!strcmp(op, "sheet") || !strcmp(op, "preview")) RET(op_sheet(json_in));
+    if (!strcmp(op, "convert") || !strcmp(op, "remux")) RET(op_convert(json_in));
+    if (!strcmp(op, "detect") || !strcmp(op, "analyze")) RET(op_detect(json_in));
+    if (!strcmp(op, "job") || !strcmp(op, "progress")) RET(op_job(json_in));
     if (!strcmp(op, "desub") || !strcmp(op, "delogo") || !strcmp(op, "nsub"))
-        return op_desub(json_in);
+        RET(op_desub(json_in));
 
     return errf("不支持的 op：%s。video 支持 hw / info / portrait / effects / trim / thumb / gif %s",
                 op, "");

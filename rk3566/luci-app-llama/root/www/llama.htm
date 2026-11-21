@@ -492,6 +492,14 @@
   .astep-r::-webkit-scrollbar-thumb{background:rgba(52,211,153,.28);border-radius:5px}
   .astep-r::-webkit-scrollbar-thumb:hover{background:rgba(52,211,153,.5)}
   .astep-r{scrollbar-width:thin;scrollbar-color:rgba(52,211,153,.35) transparent}
+  /* ---- 原片/处理后 双播放器 ---- */
+  .vdual{margin-top:10px}
+  .vdual-item{margin:6px 0}
+  .vdual-t{font-size:13px;color:#8ba3bd;margin:2px 0 4px 2px}
+  .vdual video{width:100%;max-width:560px;border-radius:8px;background:#000;display:block}
+  .vdual .vsrc{border:2px solid #2a3a4a}
+  .vdual .vout{border:2px solid #2f7d4f}
+
   /* ---- ffmpeg 长任务进度窗体（气泡内） ---- */
   .vjob{margin:10px 0;padding:10px 12px;border-radius:10px;background:#1b2430;
         border:1px solid #2b3a4a;max-width:520px}
@@ -1200,9 +1208,17 @@
             card.innerHTML = '<div class="dlrow"><a class="fdl" href="' + href + '">'
                            + '⬇ 下载 ' + esc(name) + '</a><span class="vjsz">'
                            + (j.size / 1048576).toFixed(1) + ' MB</span></div>';
-            var vids = videoPlayers('<a href="' + href + '">' + esc(name) + '</a>');
+            /* 任务带 src（源文件）时，完成态也出"原片 / 处理后"双播放器 */
             el.appendChild(card);
-            if (vids) el.insertAdjacentHTML("beforeend", vids);
+            /* 播放器延迟 2 秒再挂：任务报 done 时 ffmpeg 还在写 moov atom，
+             * 立刻请求会拿到半截文件并永久报错（实测 err=4、画面全黑），
+             * Chrome 会把失败缓存住，onerror 重试也救不回来。 */
+            var _src = j.src, _out = j.out, _href = href, _nm = name;
+            setTimeout(function(){
+              var vids = _src ? dualPlayers(_src, _out)
+                              : videoPlayers('<a href="' + _href + '">' + esc(_nm) + '</a>');
+              if (vids) el.insertAdjacentHTML("beforeend", vids);
+            }, 2000);
             return;
           }
           if (j.state === "stopped") {
@@ -1226,6 +1242,31 @@
 
   /* 视频播放器：和音频一样放在卡片底部。cgi 已经支持 Range(206)，
    * 所以手机上能拖进度条；preload=metadata 只先取头部，不浪费流量。 */
+
+  /* 原片 / 处理后 双播放器：改过视频的结果里带 src（源文件），
+   * 两个一起显示，效果对比最直观。都走 mediad（:8091），能拖进度条。 */
+  function dualPlayers(srcPath, outPath){
+    if (!srcPath || !outPath) return "";
+    var host = location.hostname || "127.0.0.1";
+    /* 末尾加 #t=0.5：只写 preload=metadata 时浏览器不渲染首帧，框是黑的；
+     * 带时间片段的 URL 会强制显示那一帧，两个播放器都有画面才好对比。 */
+    var url = function(p){ return "//" + host + ":8091/f/" + encodeURIComponent(String(p).split("/").pop()) + "#t=0.5"; };
+    var one = function(label, p, cls){
+      return '<div class="vdual-item">'
+        + '<div class="vdual-t">' + label + '</div>'
+        + '<video class="' + cls + '" controls preload="auto" playsinline'
+        + ' onloadedmetadata="try{this.currentTime=0.5}catch(e){}"'
+        /* 任务刚 done 时 ffmpeg 可能还在写 moov，浏览器拿到半截就永久报错，
+         * 这里最多重试 3 次（每次 1.5 秒），拿到的就是完整文件 */
+        + ' onerror="var n=+(this.dataset.r||0);if(n<3){this.dataset.r=n+1;var u=this.src;setTimeout(function(v){v.load()},1500,this)}"'
+        + ' src="' + url(p) + '"></video>'
+        + '</div>';
+    };
+    return '<div class="vdual">'
+      + one("原片", srcPath, "vsrc")
+      + one("处理后", outPath, "vout")
+      + '</div>';
+  }
   function videoPlayers(html){
     var seen = {}, tags = "";
     /* 视频走 mediad:8091 —— uhttpd 不支持 Range，手机播 mp4 拖不动进度。
@@ -1453,7 +1494,9 @@
         /* 播放器必须放在所有下载链接拼完之后再加：
          * 它是靠扫 h 里的 href 找媒体的，早一步调用就一个都扫不到
          * （实测卡片里从来不出播放器，就是这个顺序问题）。 */
-        h += audioPlayers(h) + videoPlayers(h);
+        var _out = j.file || j.path || j.out || "";
+        if (j.src && _out) h += dualPlayers(j.src, _out);
+        else h += audioPlayers(h) + videoPlayers(h);
         return h;
       } catch (e) {
         /* 日志里这一行的 JSON 后面可能粘了下一段的标题
