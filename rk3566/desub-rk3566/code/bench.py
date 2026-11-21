@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Micro-benchmark of the per-frame numpy steps."""
+import importlib.util
+import os
 import sys
 import time
 
 import numpy as np
 
-sys.path.insert(0, '/opt/desub')
-import desub_npu as D
+DESUB_DIR = os.environ.get('DESUB_DIR', os.path.dirname(os.path.abspath(__file__)))
+_spec = importlib.util.spec_from_file_location(
+    'desub_rk3566', os.path.join(DESUB_DIR, 'desub-rk3566.py'))
+D = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(D)
 
 SZ = 512
 frame = np.random.randint(0, 255, (432, 576, 3), np.uint8)
