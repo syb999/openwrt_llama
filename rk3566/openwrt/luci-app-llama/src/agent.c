@@ -828,6 +828,18 @@ static void load_plugins(const char *dir) {
     while ((e = readdir(d)) != NULL) {
         size_t L = strlen(e->d_name);
         if (L < 4 || strcmp(e->d_name + L - 3, ".so") != 0) continue;
+        /* 设置里关掉的插件：连 dlopen 都不做，工具表里也不会出现。
+         * 之前只读了 /etc/llama.plugoff 却从来不查，开关等于没接上 ——
+         * 用户反馈"关不掉插件"就是这个。 */
+        char pname[80];
+        snprintf(pname, sizeof(pname), "%.*s", (int)(L - 3), e->d_name);
+        if (plugin_disabled(pname)) {
+            /* 必须登记：env_json 靠 g_disabled[] 把停用的插件报给前端，
+             * 不登记的话设置面板里就再也看不到它、无法重新打开。 */
+            mark_disabled(pname);
+            fprintf(stderr, "已停用 %s（/etc/llama.plugoff）\n", pname);
+            continue;
+        }
         char path[512];
         snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
         void *h = dlopen(path, RTLD_NOW);

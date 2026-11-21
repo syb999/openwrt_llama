@@ -2390,7 +2390,7 @@
     },
 
     video: {
-      what: "视频处理（ffmpeg）。能转竖屏、压体积、加特效和水印、合并切片、抽帧做 GIF、检测黑屏与场景切换。长任务加 async:1 后台跑，再用 job 查进度。硬件通路：编码走 rkmpp（VPU），缩放可走 scale_rkrga；软件滤镜（模糊/调色/文字）仍在 CPU。",
+      what: "视频处理。AI 去字幕（mode=npu）：在 RK3566 的 NPU 上跑 MI-GAN，逐帧把硬字幕抹掉并用真实画面重建（约 1 秒/帧，边跑边出进度）；另有纯色覆盖、裁切两种轻量模式。还能转竖屏、压体积、加特效水印、合并切片、抽帧做 GIF、检测黑屏与场景切换。长任务加 async:1 后台跑，用 job 查进度。编码走 rkmpp（VPU），缩放可走 scale_rkrga。",
       ops: [
         {n: "hw", d: "硬件能力探测（先看这个）。会告出 ffmpeg-rkrga 在不在、rkmpp 能不能用、scale_rkrga 有没有。", c: "{\"op\": \"hw\"}"},
         {n: "info", d: "看视频信息：编码/分辨率/帧率/时长/码率。", c: "{\"op\": \"video_info\", \"path\": \"/opt/mp4/01.mp4\"}"},
@@ -2409,11 +2409,11 @@
         {n: "trim", d: "截取片段：start 起始秒，duration 时长秒。", c: "{\"op\": \"trim\", \"path\": \"/opt/mp4/01.mp4\", \"start\": 300, \"duration\": 20}"},
         {n: "thumb", d: "抽一帧存 png，at 指定第几秒。", c: "{\"op\": \"thumb\", \"path\": \"/opt/mp4/01.mp4\", \"at\": 10}"},
         {n: "gif", d: "转 GIF：start/duration 选片段，width/fps 控制大小。", c: "{\"op\": \"gif\", \"path\": \"/opt/mp4/01.mp4\", \"start\": 5, \"duration\": 3}"},
-        {n: "desub", d: "去字幕（硬字幕）：自动找字幕带 → 用相邻行的真实像素重建被字盖住的内容（Y+U+V 一起补），不是模糊遮挡。参数 white/dilate/frames 可调；mode=crop 直接切掉。", c: "{\"op\": \"desub\", \"path\": \"/opt/mp4/01.mp4\"}"},
+        {n: "desub", d: "【AI 去字幕】默认 mode=npu：NPU 上跑 MI-GAN 重建被字盖住的画面（约 1 秒/帧，长片自动后台跑+进度条）。mode=fill 用上方背景色覆盖（适合纯色条字幕，零痕迹秒出）；mode=crop 直接裁掉字幕带。band_y/band_h 可手指定字幕带（像素）。", c: "{\"op\": \"desub\", \"path\": \"/opt/mp4/03.mp4\", \"mode\": \"npu\"}"},
         {n: "job", d: "查后台任务进度（portrait 加 async:1 后会返回 id）。", c: "{\"op\": \"job\", \"id\": \"portrait_1795169692\"}"}
       ],
       sample: '{"op":"portrait","path":"/opt/mp4/01.mp4","mode":"crop","async":1}',
-      note: "产物落 /opt/llama/out（磁盘）。/tmp 是 1.9G 内存盘，塞大视频会把内存和 CMA 拖死。中文水印用 /opt/llama/simhei.ttf。"
+      note: "产物落 /opt/llama/out（磁盘）。/tmp 是 1.9G 内存盘，塞大视频会把内存和 CMA 拖死。AI 去字幕需要固件已配 cma=512M + THP=never（本固件已带），跑的时候不用停 llama-server。"
     },
     netcap: {
       what: "抓包分析（tcpdump + 自己解析 pcap）。能看到：DNS 查了哪些域名、HTTPS 访问了哪些域名（TLS SNI 是明文）、明文 HTTP 的完整 URL、谁在占带宽。HTTPS 的具体路径看不到 —— 那是 TLS 加密的内容，要拿完整 URL 只能靠浏览器插件（CDP）或设备端装 CA 的中间人代理。",
@@ -2680,6 +2680,19 @@
             ev.preventDefault();
             ev.stopPropagation();
             showPlugHelp(nm);
+            return;
+          }
+          /* 整行可点：原来只有勾选框和插件名能切换，点描述文字/行空白毫无反应，
+           * 用户以为"关掉了"其实没勾上，保存时 collected 为空 → {"disabled":0}。
+           * 这里把行内任意位置（说明按钮已提前 return）都转成一次勾选切换。 */
+          var row = t && t.closest ? t.closest(".plugrow") : null;
+          if (row && t.tagName !== "INPUT" && t.tagName !== "LABEL") {
+            var cb = row.querySelector("input[data-p]");
+            if (cb) {
+              cb.checked = !cb.checked;
+              row.classList.toggle("off", !cb.checked);
+              updateTip();
+            }
           }
         }, true);
         /* 勾选状态一变就更新置灰样式 */
@@ -2724,7 +2737,8 @@
       var cbs = mask.querySelectorAll("#pluglist input[data-p]");
       for (var k = 0; k < cbs.length; k++)
         if (!cbs[k].checked) offs.push(cbs[k].getAttribute("data-p"));
-      fetch("/cgi-bin/agent?set_plugoff=" + encodeURIComponent(offs.join(",")))
+      fetch("/cgi-bin/agent?set_plugoff=" +
+              offs.map(encodeURIComponent).join(","))   /* 逗号要留作分隔符 */
         .then(function(r){ return r.json(); })
         .then(function(j){
           if (j && !j.ok) alert("插件开关保存失败：" + (j.error || ""));

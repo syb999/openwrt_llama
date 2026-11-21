@@ -277,6 +277,7 @@ static int ff_has_filter(const char *bin, const char *name) {
 
 static int g_force_sw;
 static const char *g_cur_json;
+static double g_job_fps = 25.0;   /* 给进度换算用（desub-rk3566 按帧报进度） */
 static char g_src_path[512];      /* 当前处理的源文件，用来在结果里带 "src"
                                    * 前端据此同时显示"原片/处理后"两个播放器 */
 static const char *g_cur_kind = "video";      /* 任务种类 id */
@@ -1042,8 +1043,8 @@ static void job_record(const char *id, int pid, const char *out, double total, c
     FILE *f = fopen(p, "w");
     if (!f) return;
     fprintf(f, "{\"id\":\"%s\",\"pid\":%d,\"out\":\"%s\",\"total\":%.2f,\"kind\":\"%s\","
-               "\"start\":%ld,\"src\":\"%s\"}\n",
-            id, pid, out, total, kind, (long)time(NULL), g_src_path);
+               "\"start\":%ld,\"fps\":%.4f,\"src\":\"%s\"}\n",
+            id, pid, out, total, kind, (long)time(NULL), g_job_fps, g_src_path);
     fclose(f);
 }
 
@@ -2036,8 +2037,8 @@ static char *op_desub(const char *json) {
      * 比 CPU 上的 LaMa 快 5 倍；脚本自己会停 LLM 腾内存、跑完再恢复。 */
     if (!strcmp(mode, "npu") || !strcmp(mode, "ai")) {
         char text[700], ans[240], extra[480], cmd[900], id[64], prog[512], logf[512];
-        if (access("/opt/py/migan.sh", X_OK) != 0)
-            return errf("NPU 去字幕未安装（需要板上 /opt/py/migan.sh）%s%s", "", "");
+        if (access("/opt/desub-rk3566/desub-rk3566.py", R_OK) != 0)
+            return errf("NPU 去字幕未安装（需要 /opt/desub-rk3566/desub-rk3566.py）%s%s", "", "");
         /* 字幕带外扩：自动探测常常只圈到字心，描边/下沿会留下淡淡残影 */
         int ny = (int)jget_int(json, "band_y", -1);
         int nh = (int)jget_int(json, "band_h", -1);
@@ -2059,9 +2060,16 @@ static char *op_desub(const char *json) {
         mkdir(VJOBS, 0777);
         snprintf(prog, sizeof(prog), "%s/%s.prog", VJOBS, id);
         snprintf(logf, sizeof(logf), "%s/%s.log", VJOBS, id);
-        snprintf(cmd, sizeof(cmd),
-                 "MIGAN_PROG='%s' /opt/py/migan.sh '%s' '%s' --band-y %d --band-h %d",
-                 prog, path, out, y, hh);
+        /* desub-rk3566.py 用 --band 表示"字幕带起始位置占画面高度的比例"，
+         * 不是像素。把探测到的 y 换算成比例给它。 */
+        {
+            double bandf = (double)y / (double)sh;
+            if (bandf < 0.30) bandf = 0.30;
+            if (bandf > 0.95) bandf = 0.95;
+            snprintf(cmd, sizeof(cmd),
+                     "python3 /opt/desub-rk3566/desub-rk3566.py '%s' '%s' --band %.3f",
+                     path, out, bandf);
+        }
         int want_async = (int)jget_int(json, "async", 1);
         if (want_async) {
             pid_t pid = fork();
@@ -2074,11 +2082,12 @@ static char *op_desub(const char *json) {
                 _exit(127);
             }
             if (pid < 0) return errf("启动 NPU 任务失败%s%s", "", "");
+            g_job_fps = fps;
             job_record(id, (int)pid, out, dur, "npu去字幕");
             snprintf(text, sizeof(text),
                      "**NPU 去字幕已开始（后台）**\n\n| 项 | 值 |\n|---|---|\n"
                      "| 任务 ID | `%s` |\n| 字幕区域 | `x=0 y=%d w=%d h=%d` |\n"
-                     "| 引擎 | MI-GAN（RK3566 NPU，约 2 秒/帧） |\n"
+                     "| 引擎 | desub-rk3566（MI-GAN on RKNPU） |\n"
                      "| 帧数 | %d 帧（约 %.0f 分钟） |\n| 输出 | `%s` |\n",
                      id, y, sw, hh, nfr, nfr * 2.0 / 60.0, out);
             snprintf(ans, sizeof(ans),

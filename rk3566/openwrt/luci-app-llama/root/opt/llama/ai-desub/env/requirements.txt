@@ -1,9 +1,0 @@
-# 板上实测通过的版本组合（aarch64 + manylinux2014）
-# 装法见 setup_env.sh；不要直接 pip install -r（要走 --platform 参数）
-torch==2.5.1
-numpy==2.2.6
-pillow==12.2.0
-scipy==1.15.3
-opencv-python-headless==5.1.0.95
-rknn-toolkit-lite2==2.3.2
-simple-lama-inpainting==0.1.2

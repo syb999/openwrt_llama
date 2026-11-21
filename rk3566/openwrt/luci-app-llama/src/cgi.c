@@ -941,7 +941,30 @@ int main(void) {
             while (*q && *q != '"' && i + 1 < sizeof(out)) out[i++] = *q++;
             out[i] = 0;
         }
+        /* desub-rk3566 不写 ffmpeg 的 -progress 文件，它每 25 帧往 stderr 打
+         * 一行 "  N frames"。这里退化成解析日志换算进度。 */
+        double fps = 25.0;
+        if ((q = strstr(jb, "\"fps\":"))) fps = atof(q + 6);
+        if (fps < 1) fps = 25.0;
+
         f = fopen(pp, "r");
+        if (!f) {
+            char lp[256];
+            snprintf(lp, sizeof(lp), "/tmp/llama_agent/vjobs/%s.log", id);
+            FILE *lf = fopen(lp, "r");
+            if (lf) {
+                char line[256];
+                long last = 0;
+                while (fgets(line, sizeof(line), lf)) {
+                    char *e;
+                    long v = strtol(line, &e, 10);
+                    if (e != line && v > 0 && strstr(e, "frames")) last = v;
+                    if (strstr(line, "done:")) ended = 1;   /* desub-rk3566 的完成标记 */
+                }
+                fclose(lf);
+                if (last > 0) done = (double)last / fps;
+            }
+        }
         if (f) {
             char line[256];
             while (fgets(line, sizeof(line), f)) {
@@ -1067,6 +1090,10 @@ int main(void) {
             if (pl >= sizeof(pv)) pl = sizeof(pv) - 1;
             memcpy(pv, v, pl);
             pv[pl] = 0;
+            /* 前端用 encodeURIComponent 拼名单时逗号会变成 %2C；不解码的话
+             * "jq%2Cbatch%2Cmusic" 会被当成一个非法名字整条丢掉 —— 表现就是
+             * 只能关一个插件，关第二个时文件被清空。 */
+            url_decode(pv);
             do_set_plugoff(pv);
             return 0;
         }
