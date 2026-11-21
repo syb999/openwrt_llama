@@ -35,6 +35,7 @@
 
 static plugin_desc_t *g_plug[MAX_PLUGINS];
 static int g_n = 0;
+static int g_direct_answer = 1;   /* 插件已给答案时不再让模型复述 */
 /* 插件启停：名单落在 /etc/llama.plugoff，加载时跳过被停用的插件。
  * 放在文件最前面是因为 env_json 也要读（它比 load_plugins 早）。 */
 static char g_plugoff[512] = {0};
@@ -972,6 +973,16 @@ static const route_t ROUTES[] = {
     {"table", "排序|排行|top|TOP|筛选|名次|前.*名"},
     {"batch", "分批|大量|很多(页|章|节)|长文档|多章节|整套"},
     {"sysmon","监控|巡检|告警|阈值|采样"},
+    /* 抓包类：必须单独一项，否则这句话在 3B 眼里就是个知识问答
+     * （实测直接答"你可以用 Wireshark"）。命中后只提供 netcap 一个插件，
+     * 模型没有别的可挑，选对的概率高得多。 */
+    {"video",  "视频|竖屏|横屏|转码|压缩视频|压缩.*视频|mp4|MP4|抽帧|缩略图|截图.*视频|"
+               "GIF|gif|特效|水印|淡入|淡出|变速|播放|合并.*视频|视频.*合并|切片|分段|"
+               "提取音轨|静音|场景检测|黑屏|转成mkv|转成mov|去字幕|去除字幕|字幕|"
+               "去掉字幕|擦掉.*字幕"},
+    {"netcap", "抓包|tcpdump|pcap|sniff|"
+               "抓.{0,4}秒|抓.{0,6}流量|流量.{0,8}(访问|看看|哪些)|"
+               "访问了什么|访问了哪些|访问哪些网站|谁在占带宽|带宽占用"},
 };
 
 /* 返回选中插件的下标数组，返回个数；0 = 没命中（调用方应该全列） */
@@ -1054,11 +1065,22 @@ static const char *op_to_plugin(const char *js, const char *op) {
         {"sysinfo","sys"}, {"shell","sys"}, {"list","sys"}, {"du","sys"},
         {"grep","sys"}, {"http_get","sys"}, {"download","sys"},
         {"uci_get","owrt"}, {"uci_set","owrt"}, {"uci_commit","owrt"},
+        {"capture","netcap"}, {"urls","netcap"}, {"sni","netcap"},
+        {"dnsq","netcap"}, {"cap_http","netcap"}, {"ifaces","netcap"},
+        {"top","netcap"},
+        {"portrait","video"}, {"effects","video"}, {"video_info","video"},
+        {"trim","video"}, {"thumb","video"}, {"gif","video"}, {"hw","video"},
+        {"compress","video"}, {"audio","video"}, {"watermark","video"},
+        {"crop","video"}, {"scale","video"}, {"concat","video"}, {"merge","video"},
+        {"split","video"}, {"sheet","video"}, {"convert","video"},
+        {"detect","video"}, {"job","video"},
+        {"desub","video"}, {"delogo","video"}, {"nsub","video"},
         {"uci_show","owrt"}, {"uci_changes","owrt"}, {"uci_delete","owrt"},
         {"uci_add_list","owrt"}, {"uci_del_list","owrt"}, {"uci_revert","owrt"},
         {"iwinfo","owrt"}, {"iw","owrt"}, {"service","owrt"}, {"logread","owrt"},
         {"passwd","owrt"}, {"reboot","owrt"}, {"opkg_list","owrt"},
         {"midi","music"}, {"render","music"}, {"import","music"}, {"wav","music"},
+        {"bgm","music"},
         {"parse","curl"},        /* curl 插件的 op 名是 parse（吃 cURL 原文） */
         {"snapshot","sysmon"},
         {"start","sysmon-auto"}, {"stop","sysmon-auto"}, {"status","sysmon-auto"},
@@ -1078,6 +1100,8 @@ static int try_direct_plugin(const char *task) {
     if (!pw) return 0;
     plugin_desc_t *pl = find_plugin(pw);
     if (!pl) return 0;
+    printf("【插件 %s 开始工作】\n", pw);
+    fflush(stdout);
     char *res = pl->run(task);
     if (res) {
         printf("%s\n", res);
@@ -1199,7 +1223,7 @@ static char *tools_prompt(const char *task) {
             plugin_desc_t *p = g_plug[idx[i]];
             char dshort[256];
             snprintf(dshort, sizeof(dshort), "%s", p->description ? p->description : "");
-            utf8_cut(dshort, 150);
+            utf8_cut(dshort, 80);
             off += (size_t)snprintf(s + off, SMALL - off, "- %s：%s\n", p->name, dshort);
         }
     } else {
@@ -1210,7 +1234,7 @@ static char *tools_prompt(const char *task) {
              * 能把 system prompt 撑到 4KB —— RK3566 上 3B 一步要多跑两三百秒。 */
             char dshort[256];
             snprintf(dshort, sizeof(dshort), "%s", g_plug[i]->description ? g_plug[i]->description : "");
-            utf8_cut(dshort, 150);
+            utf8_cut(dshort, 80);
             off += (size_t)snprintf(s + off, SMALL - off, "- %s：%s\n",
                                     g_plug[i]->name, dshort);
         }
@@ -1309,6 +1333,26 @@ static const chunk_rule_t CHUNKS[] = {
 };
 
 /* 按顺序执行任务里的各个动作块；返回执行了几块（0 = 没命中，走模型） */
+/* downloads 里有没有 30 分钟内的 json —— 表格类分块靠它判断"有没有数据源" */
+static int has_fresh_json(void) {
+    DIR *d = opendir(WORK_DIR "/downloads");
+    if (!d) return 0;
+    struct dirent *e;
+    time_t now = time(NULL);
+    int ok = 0;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        if (!strstr(e->d_name, ".json")) continue;
+        char p[900];
+        snprintf(p, sizeof(p), "%s/downloads/%s", WORK_DIR, e->d_name);
+        struct stat st;
+        if (stat(p, &st) != 0) continue;
+        if (now - st.st_mtime < 1800) { ok = 1; break; }
+    }
+    closedir(d);
+    return ok;
+}
+
 static int run_task_chunks(const char *task) {
     typedef struct { size_t pos; int ri; } hit_t;
     hit_t hits[8];
@@ -1341,6 +1385,13 @@ static int run_task_chunks(const char *task) {
         const chunk_rule_t *cr = &CHUNKS[hits[hi].ri];
         plugin_desc_t *pl = find_plugin(cr->plugin);
         if (!pl) continue;
+
+        /* jq 的 table 必须有数据源。以前不管有没有数据都执行，jq 只好退到
+         * downloads 里最新的 json —— 拿一份无关旧数据编出一张看着像样的表，
+         * 用户看到的就"jq 报错"或"答非所问"。这里先判断，没源就跳过这一步。 */
+        if (!strcmp(cr->plugin, "jq") && !strcmp(cr->op, "table")
+            && !prev_file[0] && !g_prefetched && !has_fresh_json())
+            continue;
 
         char args[8192];
         if (cr->use_prev) {
@@ -1478,11 +1529,14 @@ static int run_login_flow(const char *task) {
         jval *j = json_parse(res, jerr, sizeof(jerr));
         const char *emsg = j ? json_str(json_get(j, "error")) : NULL;
         const char *hint = j ? json_str(json_get(j, "hint")) : NULL;
+        /* ★ 这里的占位符是 4 个（%s %s %s %.600s），原来只给了 3 个参数，
+         *   %.600s 会去读一个不存在的可变参数 —— 登录失败时可能段错误。
+         *   括号也顺手改成跟 hint 一起闭合。 */
         snprintf(g_login_diag, sizeof(g_login_diag),
-                 "原因：%s%s%s\n原始返回：%.600s",
+                 "原因：%s%s%s%s\n原始返回：%.600s",
                  emsg ? emsg : "登录没通过",
-                 hint ? "（" : "", hint ? hint : "");
-        if (hint) strncat(g_login_diag, "）", sizeof(g_login_diag) - strlen(g_login_diag) - 1);
+                 hint ? "（" : "", hint ? hint : "", hint ? "）" : "",
+                 res);
         if (j) json_free(j);
     }
     free(res);
@@ -1568,6 +1622,8 @@ static int try_math_direct(const char *task) {
     char *call = malloc(strlen(esc) + 64);
     if (!call) { free(esc); return 0; }
     snprintf(call, strlen(esc) + 64, "{\"op\":\"plan\",\"task\":\"%s\"}", esc);
+    printf("【插件 math 开始工作】\n");
+    fflush(stdout);
     char *res = pl->run(call);
     free(call);
     free(esc);
@@ -1605,6 +1661,8 @@ static int try_music_direct(const char *task) {
     char *call = malloc(strlen(esc) + 48);
     if (!call) { free(esc); return 0; }
     snprintf(call, strlen(esc) + 48, "{\"op\":\"bgm\",\"task\":\"%s\"}", esc);
+    printf("【插件 music 开始工作】\n");
+    fflush(stdout);
     char *res = pl->run(call);
     free(call);
     free(esc);
@@ -1615,7 +1673,615 @@ static int try_music_direct(const char *task) {
     return 1;
 }
 
+/* ---------- "把上面的 csv/表格转成 excel" ----------
+ *
+ * 这是很常见的一句追问，但它是【新的一次 agent 调用】，进程里没有上一轮
+ * 的任何状态。以前会掉给模型：3B 看到"上面的csv"就去猜路径，或者干脆
+ * 瞎答 —— 用户体感就是"答非所问"。
+ *
+ * csv 都是 jq.table / table 插件写出来的，就落在 WORK_DIR/downloads 下，
+ * 而且同一批数据会带同样的前缀（resp_xxx_sub_*.csv）。所以：找 30 分钟内
+ * 最新的 csv，同前缀的一起作为多 sheet，直接调 doc.xlsx。
+ */
+static int newest_csv(char *out, size_t cap, char *prefix, size_t pcap) {
+    static const char *dirs[] = { WORK_DIR "/downloads", WORK_DIR "/gen", WORK_DIR, NULL };
+    time_t best = 0, now = time(NULL);
+    out[0] = 0;
+    prefix[0] = 0;
+    for (int d = 0; dirs[d]; d++) {
+        DIR *dp = opendir(dirs[d]);
+        if (!dp) continue;
+        struct dirent *e;
+        while ((e = readdir(dp)) != NULL) {
+            size_t L = strlen(e->d_name);
+            if (L < 4 || strcasecmp(e->d_name + L - 4, ".csv")) continue;
+            char full[900];
+            snprintf(full, sizeof(full), "%s/%s", dirs[d], e->d_name);
+            struct stat st;
+            if (stat(full, &st) != 0) continue;
+            if (now - st.st_mtime > 1800) continue;      /* 超过 30 分钟不要 */
+            if (st.st_mtime >= best) {
+                best = st.st_mtime;
+                snprintf(out, cap, "%s", full);
+                /* 前缀：去掉 _sub_xxx.csv 或 .csv 结尾 */
+                snprintf(prefix, pcap, "%s", e->d_name);
+                char *sub = strstr(prefix, "_sub_");
+                if (sub) *sub = 0;
+                else {
+                    char *dot = strrchr(prefix, '.');
+                    if (dot) *dot = 0;
+                }
+            }
+        }
+        closedir(dp);
+    }
+    return out[0] ? 1 : 0;
+}
+
+static int try_csv_to_xlsx(const char *task) {
+    if (!task || task[0] == '{') return 0;
+    int want_x = strstr(task, "excel") || strstr(task, "Excel") || strstr(task, "xlsx")
+              || strstr(task, "电子表格");
+    int has_csv = strstr(task, "csv") || strstr(task, "CSV") || strstr(task, "表格");
+    /* "输出 excel""写成 excel""另存为"都是同一个意思 —— 少一个词就整条快速
+     * 通道失效，掉给模型后它会反复造 csv，跑几分钟都停不下来（实测 400 秒+）。 */
+    int act = strstr(task, "转") || strstr(task, "导出") || strstr(task, "生成")
+           || strstr(task, "做成") || strstr(task, "变成") || strstr(task, "存成")
+           || strstr(task, "输出") || strstr(task, "写成") || strstr(task, "另存")
+           || strstr(task, "保存") || strstr(task, "做成表格") || strstr(task, "弄成");
+    if (!want_x || !has_csv || !act) return 0;
+
+    char csv[900], prefix[300];
+    if (!newest_csv(csv, sizeof(csv), prefix, sizeof(prefix))) {
+        printf("（没找到 30 分钟内的 csv —— 先把数据做成表格，或者直接把文件路径给我）\n");
+        return 0;      /* 回落给模型，让它问清楚 */
+    }
+
+    /* 同前缀的兄弟 csv 一起做成多 sheet（jq.table 生成的 resp_xxx_sub_*.csv） */
+    char sheets[4096] = {0};
+    size_t si = 0;
+    const char *dir = WORK_DIR "/downloads";
+    DIR *dp = opendir(dir);
+    int nsheet = 0;
+    if (dp) {
+        struct dirent *e;
+        while ((e = readdir(dp)) != NULL) {
+            if (!strstr(e->d_name, ".csv")) continue;
+            if (prefix[0] && !strstr(e->d_name, prefix)) continue;
+            char full[900];
+            snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
+            struct stat st;
+            if (stat(full, &st) != 0) continue;
+
+            /* sheet 名：去掉前缀和 .csv */
+            char nm[64];
+            snprintf(nm, sizeof(nm), "%s", e->d_name);
+            char *dot = strrchr(nm, '.');
+            if (dot) *dot = 0;
+            if (prefix[0]) {
+                char *pp = strstr(nm, prefix);
+                if (pp) memmove(nm, pp + strlen(prefix), strlen(pp + strlen(prefix)) + 1);
+            }
+            while (nm[0] == '_') memmove(nm, nm + 1, strlen(nm));
+            /* 净化：文件名里可能出现引号/逗号/斜杠（表头被当文件名时就见过），
+             * 直接拼进 JSON 会把 csv_files 结构搞坏 → 生成一堆畸形文件 */
+            for (char *q2 = nm; *q2; q2++)
+                if (*q2 == '"' || *q2 == '\\' || *q2 == ',' || *q2 == '\n' ||
+                    *q2 == '\r' || *q2 == '/' || *q2 == ':')
+                    *q2 = '_';
+            if (!nm[0]) snprintf(nm, sizeof(nm), "Sheet%d", nsheet + 1);
+            if (strlen(nm) > 40) nm[40] = 0;   /* 粗限，别让表头整段进 sheet 名 */
+
+            si += (size_t)snprintf(sheets + si, sizeof(sheets) - si,
+                "%s{\"name\":\"%s\",\"path\":\"%s\"}", si ? "," : "", nm, full);
+            nsheet++;
+            if (si > sizeof(sheets) - 900) break;
+        }
+        closedir(dp);
+    }
+    if (!nsheet) {      /* 只有主表 */
+        snprintf(sheets, sizeof(sheets), "{\"name\":\"Sheet1\",\"path\":\"%s\"}", csv);
+        nsheet = 1;
+    }
+
+    plugin_desc_t *pl = find_plugin("doc");
+    if (!pl) return 0;
+    char outp[900], call[6000];
+    mkdir(WORK_DIR "/gen", 0777);
+    snprintf(outp, sizeof(outp), "%s/gen/%s.xlsx", WORK_DIR,
+             prefix[0] ? prefix : "table");
+    snprintf(call, sizeof(call),
+        "{\"op\":\"xlsx\",\"path\":\"%s\",\"csv_files\":[%s]}", outp, sheets);
+    printf("（直接转：用最新 csv `%s`，共 %d 个 sheet）\n", csv, nsheet);
+    printf("【插件 doc 开始工作】\n");
+    fflush(stdout);
+    char *res = pl->run(call);
+    if (!res) return 0;
+    if (strstr(res, "\"error\"")) { free(res); return 0; }
+    printf("%s\n", res);
+    free(res);
+    return 1;
+}
+
+/* ---------- 写指定字数的文章 ----------
+ *
+ * 为什么以前永远差很远：主循环的 max_tokens 是写死的 180（纯对话）/240，
+ * 跟用户要多少字毫无关系。要 800 字的文章，模型在 180 token 就被截断，
+ * 只能给出 200 来字，而且它自己也"不知道"被截断了。
+ *
+ * 这里单独走一条写作通道：
+ *   ① 从任务里抠出目标字数，按 1 字≈1.6 token 放大 max_tokens（留余量）
+ *   ② 写完用 C 自己数（中文字/英文词，不含标点），模型数数不可信
+ *   ③ 差超过 12% 就再要一轮：把已有正文给它，让它扩写/压缩到目标
+ *   ④ 最终答案里如实报"实际 N 字（目标 M 字）"
+ */
+#define ART_MAXROUND 4
+
+/* 数中文字数：CJK 每字算 1，连续的英文/数字算 1 个词，标点/空白/markdown 不算 */
+static int count_chars(const char *t) {
+    int n = 0, in_word = 0;
+    for (const unsigned char *p = (const unsigned char *)t; *p; p++) {
+        if (*p >= 0xE0) {                       /* 3 字节汉字（含全角标点） */
+            unsigned cp = ((p[0] & 0x0f) << 12) | ((p[1] & 0x3f) << 6) | (p[2] & 0x3f);
+            /* 全角标点不算字：，。、；：？！“”‘’（）《》—…·【】 */
+            if (!((cp >= 0x3000 && cp <= 0x303f) || (cp >= 0xff00 && cp <= 0xff0f) ||
+                  (cp >= 0x2010 && cp <= 0x2027) || cp == 0x2026 || cp == 0x2014))
+                n++;
+            in_word = 0;
+            p += 2;
+        } else if ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')) {
+            if (!in_word) { n++; in_word = 1; }
+        } else {
+            in_word = 0;
+        }
+    }
+    return n;
+}
+
+/* 从任务里抠"800字""300 字""1500个字" */
+static int want_chars(const char *t) {
+    for (const char *p = t; *p; p++) {
+        if (*p < '0' || *p > '9') continue;
+        /* 前面不能紧挨着数字/字母（避免从 "2026" 里抠） */
+        if (p > t && (isdigit((unsigned char)p[-1]) || isalpha((unsigned char)p[-1]))) continue;
+        long v = atol(p);
+        const char *q = p;
+        while (*q >= '0' && *q <= '9') q++;
+        while (*q == ' ') q++;
+        /* ★ 不能用 *q == '字'：'字' 是多字节常量（int），*q 是单字节，
+         *   两者永远不相等 —— 之前就是这里写错，目标字数永远抠不出来，
+         *   整条写作通道形同虚设。必须按 UTF-8 字节序列比较。 */
+        if (!strncmp(q, "字", 3) || !strncmp(q, "个字", 6) || !strncmp(q, "字数", 6)) {
+            if (v >= 20 && v <= 20000) return (int)v;
+        }
+    }
+    return 0;
+}
+
+static int is_article_task(const char *t) {
+    int w = strstr(t, "文章") || strstr(t, "作文") || strstr(t, "短文")
+         || strstr(t, "报告") || strstr(t, "文案") || strstr(t, "总结")
+         || strstr(t, "演讲稿") || strstr(t, "简介") || strstr(t, "介绍词");
+    int a = strstr(t, "写") || strstr(t, "生成") || strstr(t, "来一篇")
+         || strstr(t, "帮我写") || strstr(t, "起草");
+    return w && a;
+}
+
+/* ---------- 长文分段生成（含 topup 补写）----------
+ *
+ * 800 字一次性生成实测跑 35 分钟还没出结果：max_tokens 1640 × 1.5 tok/s
+ * 就要 18 分钟，而且模型经常写不到目标又跑一轮 —— 翻倍。分段做：
+ *   每段 300 字左右，独立请求，前一段的结尾作为下一段的上下文。
+ * 好处：① 每次只生成 300 来 token，2~3 分钟返回，永远碰不到超时
+ *       ② 结构更清楚（每段有明确主题）
+ *       ③ 某一段失败只损失那一段，不用整篇重来
+ */
+static void jesc(const char *in, char *out, size_t cap) {
+    size_t k = 0;
+    for (const char *p = in; *p && k + 8 < cap; p++) {
+        if (*p == '"' || *p == '\\') { out[k++] = '\\'; out[k++] = *p; }
+        else if (*p == '\n') { out[k++] = '\\'; out[k++] = 'n'; }
+        else if (*p == '\r') { out[k++] = '\\'; out[k++] = 'r'; }
+        else out[k++] = *p;
+    }
+    out[k] = 0;
+}
+
+static char *write_by_sections(const char *task, int target, const char *host,
+                               int port, const char *model, int *out_chars) {
+    int per = 300;
+    int nsec = (target + per - 1) / per;
+    if (nsec < 2) nsec = 2;
+    if (nsec > 12) nsec = 12;
+    int each = target / nsec;
+    if (each < 120) each = 120;
+
+    printf("（长文分段：%d 段，每段约 %d 字）\n", nsec, each);
+
+    char *all = calloc(1, 40000);
+    if (!all) return NULL;
+    size_t used = 0;
+    char tail[400] = {0};          /* 上一段结尾，给下一段接续 */
+
+    /* outline_first 先要一份提纲：模型对着"某个要点"写，比对着"第 2/3 部分"写要充实得多。
+     * 实测只给"约 266 字"它只写 85 字；给了明确要点才能写够。 */
+    char outline[1600] = {0};
+    {
+        char te[6000], body[BIG];
+        jesc(task, te, sizeof(te));
+        snprintf(body, BIG,
+            "{\"model\":\"%s\",\"messages\":["
+            "{\"role\":\"system\",\"content\":\"只输出提纲，每行一个要点，"
+            "每行不超过 12 个字，不要编号不要解释，共 %d 行。\"},"
+            "{\"role\":\"user\",\"content\":\"%s\"}],"
+            "\"max_tokens\":220,\"temperature\":0.5,\"stream\":false}",
+            model, nsec, te);
+        char *r = http_post(host, port, "/v1/chat/completions", body, 300);
+        if (r) {
+            char *c = extract_content(r);
+            free(r);
+            if (c) snprintf(outline, sizeof(outline), "%s", c);
+            free(c);
+            if (outline[0]) printf("（提纲：%.80s…）\n", outline);
+        }
+    }
+
+    for (int i = 1; i <= nsec; i++) {
+        char te[6000], tl[1200], body[BIG];
+        jesc(task, te, sizeof(te));
+        jesc(tail, tl, sizeof(tl));
+
+        /* 从提纲里取第 i 行作为本段要点 */
+        char point[200] = {0};
+        {
+            int ln = 0;
+            const char *q = outline;
+            while (*q) {
+                /* 模型常把提纲挤成一行用分号连起来，换行/；/。 都当分隔 */
+                size_t L = strcspn(q, "\n");
+                size_t s1 = strcspn(q, "；");
+                size_t s2 = strcspn(q, ";");
+                size_t s3 = strcspn(q, "。");
+                if (s1 < L) L = s1;
+                if (s2 < L) L = s2;
+                if (s3 < L) L = s3;
+                const char *e = q + L;
+                if (!*e) e = NULL;
+                if (L) {
+                    ln++;
+                    if (ln == i) {
+                        size_t k = 0;
+                        while (k < L && k + 1 < sizeof(point)) {
+                            char c = q[k];
+                            if (c == '*' || c == '#' || c == '-' || c == ' ')
+                                { k++; continue; }
+                            break;
+                        }
+                        size_t m = 0;
+                        for (; k < L && m + 1 < sizeof(point); k++, m++) point[m] = q[k];
+                        point[m] = 0;
+                        break;
+                    }
+                }
+                if (!e) break;
+                q = e + 1;
+            }
+        }
+
+        char pte[900] = {0};
+        if (point[0]) jesc(point, pte, sizeof(pte));
+
+        /* 硬性下限：3B 对"约 N 字"不敏感，实测要 266 只给 85；
+         * 写"不少于 N 字，分 2~3 个自然段，每段 3~5 句"才有效。 */
+        int floor_chars = each * 8 / 10;
+
+        /* 一条 user 消息里把"任务 + 本段要求"写完。
+         * 之前拆成两条 user，Qwen 的模板下会返回空内容（实测两段全空）。 */
+        char plain[1200], pie[1800];
+        if (i == 1)
+            snprintf(plain, sizeof(plain),
+                "%s\n\n请写第 1/%d 段，主题：%s。约 %d 字（不少于 %d 字），"
+                "分 2~3 个自然段，每段 3~5 句，要有具体的地名、时间、数据。",
+                task, nsec, point[0] ? point : "开头", each, floor_chars);
+        else
+            snprintf(plain, sizeof(plain),
+                "%s\n\n接着上面写第 %d/%d 段，主题：%s。约 %d 字（不少于 %d 字），"
+                "分 2~3 个自然段，不要重复前面的内容%s。",
+                task, i, nsec, point[0] ? point : "继续", each, floor_chars,
+                (i == nsec ? "，这一段做个收尾" : ""));
+        jesc(plain, pie, sizeof(pie));
+
+        if (i == 1)
+            snprintf(body, BIG,
+                "{\"model\":\"%s\",\"messages\":["
+                "{\"role\":\"system\",\"content\":\"你是中文写作助手。直接输出正文，"
+                "不要标题、不要解释、不要标注字数。\"},"
+                "{\"role\":\"user\",\"content\":\"%s\"}],"
+                "\"max_tokens\":%d,\"temperature\":0.7,\"stream\":false}",
+                model, pie, each * 3 + 200);
+        else
+            snprintf(body, BIG,
+                "{\"model\":\"%s\",\"messages\":["
+                "{\"role\":\"system\",\"content\":\"你是中文写作助手。直接输出正文，"
+                "不要标题、不要解释、不要标注字数。\"},"
+                "{\"role\":\"assistant\",\"content\":\"…%s\"},"
+                "{\"role\":\"user\",\"content\":\"%s\"}],"
+                "\"max_tokens\":%d,\"temperature\":0.7,\"stream\":false}",
+                model, tl, pie, each * 3 + 200);
+
+        int to = each * 3 + 300;
+        if (to < 240) to = 240;
+        if (to > 900) to = 900;
+        char *resp = http_post(host, port, "/v1/chat/completions", body, to);
+        if (!resp) { printf("（第 %d 段超时/断连，跳过）\n", i); continue; }
+        char *c = extract_content(resp);
+        free(resp);
+        if (!c) {
+            printf("（第 %d 段返回空，跳过）\n", i);
+            if (getenv("ART_DEBUG")) printf("  [body] %.500s\n", body);
+            continue;
+        }
+
+        int n = count_chars(c);
+        printf("（第 %d/%d 段：%d 字）\n", i, nsec, n);
+        if (used + strlen(c) + 4 < 40000) {
+            memcpy(all + used, c, strlen(c));
+            used += strlen(c);
+            all[used++] = '\n';
+            all[used] = 0;
+        }
+        /* 记住结尾 200 字给下一段接续 */
+        size_t L = strlen(c);
+        size_t take = L > 200 ? 200 : L;
+        const char *p = c + (L - take);
+        while (take > 0 && ((unsigned char)*p & 0xC0) == 0x80) { p++; take--; }
+        snprintf(tail, sizeof(tail), "%s", p);
+        free(c);
+    }
+
+    *out_chars = count_chars(all);
+
+    /* 3B 每段都会写短（要 300 只给 160~250）。收尾补一段，别让用户拿到
+     * 一篇明显不够数的文章。只补一次，补不动就如实报字数。 */
+    /* 写超了也要收：模型常把 150 字写成 240 字，两段就超 28%。
+     * 超过目标 15% 就压一次 —— 比"补写"便宜（输出更短）。 */
+    if (*out_chars > target + target / 6) {
+        char te2[6000], ae[24000], body[BIG];
+        jesc(task, te2, sizeof(te2));
+        jesc(all, ae, sizeof(ae));
+        snprintf(body, BIG,
+            "{\"model\":\"%s\",\"messages\":["
+            "{\"role\":\"system\",\"content\":\"你是中文编辑。只输出压缩后的正文，"
+            "不要解释、不要标注字数。\"},"
+            "{\"role\":\"user\",\"content\":\"把下面这段压缩到 %d 字左右"
+            "（不超过 %d 字），保留全部关键事实和结构，删掉重复和铺陈，"
+            "直接输出压缩后的完整正文：\\n\\n%s\"}],"
+            "\"max_tokens\":%d,\"temperature\":0.3,\"stream\":false}",
+            model, target, target + target / 10, ae, target * 3 + 200);
+        char *r = http_post(host, port, "/v1/chat/completions", body, target * 2 + 300);
+        if (r) {
+            char *c = extract_content(r);
+            free(r);
+            if (c) {
+                int n = count_chars(c);
+                if (n > 0 && n < *out_chars) {
+                    printf("（压缩：%d 字 → %d 字）\n", *out_chars, n);
+                    snprintf(all, 40000, "%s", c);
+                    *out_chars = n;
+                }
+                free(c);
+            }
+        }
+    }
+
+    for (int tp = 0; tp < 2; tp++) {
+    int lack = target - *out_chars;
+    if (lack <= target / 8) break;
+    {
+        char te[6000], tl[1200], body[BIG];
+        jesc(task, te, sizeof(te));
+        jesc(tail, tl, sizeof(tl));
+        int want = lack;
+        if (want > 400) want = 400;
+        snprintf(body, BIG,
+            "{\"model\":\"%s\",\"messages\":["
+            "{\"role\":\"system\",\"content\":\"你是中文写作助手。直接输出正文，"
+            "不要标题、不要解释、不要标注字数。\"},"
+            "{\"role\":\"user\",\"content\":\"%s\"},"
+            "{\"role\":\"assistant\",\"content\":\"…%s\"},"
+            "{\"role\":\"user\",\"content\":\"接着上面再写一段，主题换成这条：%s，"
+            "写 %d 字（不少于 %d 字），分 2 个自然段，要有具体例子。\"}],"
+            "\"max_tokens\":%d,\"temperature\":0.7,\"stream\":false}",
+            model, te, tl, te, want, want * 8 / 10, want * 3 + 150);
+        int to = want * 3 + 200;
+        if (to > 900) to = 900;
+        char *r = http_post(host, port, "/v1/chat/completions", body, to);
+        if (r) {
+            char *c = extract_content(r);
+            free(r);
+            if (c) {
+                int n = count_chars(c);
+                printf("（补写：%d 字）\n", n);
+                if (used + strlen(c) + 4 < 40000) {
+                    memcpy(all + used, c, strlen(c));
+                    used += strlen(c);
+                    all[used++] = '\n';
+                    all[used] = 0;
+                }
+                *out_chars = count_chars(all);
+                free(c);
+            }
+        }
+    }
+    }
+    return all;
+}
+
+static char *try_write_article(const char *task, const char *host, int port,
+                               const char *model) {
+    if (!task || task[0] == '{') return 0;
+    if (!is_article_task(task)) return 0;
+
+    int target = want_chars(task);
+    if (target <= 0) return 0;          /* 没写字数就按普通对话走 */
+
+    /* 统一走分段。为什么不保留"单次生成 + 多轮补足"：
+     * 那条路最坏情况是一次请求生成 7000 token（1.5 tok/s ≈ 78 分钟），
+     * 只能靠超时兜底，是不可控的。分段每次只生成约 300 字，
+     * 单次请求 2~3 分钟必然返回，超时风险从"可能"变成"不可能"。
+     * 实测：600 字 → 613 字（+2%），比单次路线更准也更稳。 */
+    int got = 0;
+    char *txt = write_by_sections(task, target, host, port, model, &got);
+    if (!txt) return 0;                 /* 全失败 → 回落正常对话，不硬扛 */
+
+    printf("\n最终回答: %s\n", txt);
+    printf("\n【字数】实际 %d 字 / 目标 %d 字（偏差 %d%%）\n",
+           got, target, target ? (int)((got - target) * 100 / target) : 0);
+    free(txt);
+    return 1;
+}
+
+/* ---------- 插件已给出答案就直接收 ----------
+ *
+ * 自然语言任务走两段：① 模型选插件 ② 模型把插件返回的 JSON 转成人话。
+ * 第②段纯浪费 —— 我们的插件本来就返回 answer 字段（中文一句话），
+ * 模型只是把它重说一遍。实测同一个抓包任务：第①段 62 秒，第②段 189 秒，
+ * 而第②段产出的那句话跟插件的 answer 一模一样。
+ *
+ * 所以：插件返回 ok + answer 时，直接把结果给用户，不再问模型。
+ * 只对"自成一体"的插件这么做 —— browser/batch/curl 常常是链条中的一环
+ * （抓回来还要接着分析），跳过后面的步骤就断了。
+ */
+static int try_direct_answer(const char *tool, const char *out, int step) {
+    if (!g_direct_answer) return 0;
+    if (step > 1) return 0;                  /* 多步任务里不抢 */
+    if (!out || strstr(out, "\"error\"")) return 0;
+
+    static const char *SELF[] = {"netcap", "sys", "owrt", "music", "math",
+                                 "doc", "jq", "table", "sysmon", NULL};
+    int ok = 0;
+    for (int i = 0; SELF[i]; i++)
+        if (!strcmp(tool, SELF[i])) { ok = 1; break; }
+    if (!ok) return 0;
+
+    /* 必须有 answer 且够像一句话（太短的"ok"不算答案） */
+    char ans[600] = {0};
+    json_str_field(out, "answer", ans, sizeof(ans));
+    if (strlen(ans) < 6) return 0;
+    if (!strstr(out, "\"ok\"") && !strstr(out, "\"value\"")) return 0;
+
+    printf("\n最终回答: %s\n", ans);
+    printf("\n（插件结论直接采用，没有再让模型复述一遍）\n");
+    return 1;
+}
+
+/* ---------- 视频类自然语言直连 ----------
+ *
+ * "把 X.mp4 转成黑白视频" 这种句式，3B 实测会把 .mp4 发给 doc（报
+ * "扩展名 .mp4 与操作不符（应为 .xlsx）"），或者把路径编成 /opt/video/01.mp4。
+ * 任务里已经写明了文件路径和动作，没必要让模型猜 —— 直接派发。
+ *
+ * 只处理"路径 + 明确动作词"的组合，认不出就回落给模型（不硬猜）。
+ */
+static void jesc_video(const char *in, char *out, size_t cap) {
+    size_t k = 0;
+    for (const char *p = in; *p && k + 8 < cap; p++) {
+        if (*p == '"' || *p == '\\') { out[k++] = '\\'; out[k++] = *p; }
+        else if (*p == '\n') { out[k++] = '\\'; out[k++] = 'n'; }
+        else out[k++] = *p;
+    }
+    out[k] = 0;
+}
+
+static int find_video_path(const char *task, char *out, size_t cap) {
+    static const char *exts[] = {".mp4", ".mkv", ".mov", ".m4v", ".avi", ".flv", ".ts", ".webm", NULL};
+    /* 从扩展名往回找路径起点：文件名里可能有中文（三国演义01.mp4），
+     * 所以不能"遇到非 ASCII 就截断"，只能靠空格/引号/标点分界。 */
+    for (const char *p = task; *p; p++) {
+        for (int i = 0; exts[i]; i++) {
+            size_t le = strlen(exts[i]);
+            if (strncasecmp(p, exts[i], le) != 0) continue;
+            /* p 指向扩展名开头，往回走到分界 */
+            const char *b = p;
+            while (b > task) {
+                unsigned char c = (unsigned char)b[-1];
+                if (c == ' ' || c == '\t' || c == '\n' || c == '"' || c == '\'' ||
+                    c == '(' || c == ')' || c == '[' || c == ']' || c == ',' || c == ';')
+                    break;
+                b--;
+            }
+            size_t L = (size_t)(p + le - b);
+            if (L < 6 || L >= 700) continue;
+            if (*b != '/') continue;            /* 必须以 / 开头才算路径 */
+            char cand[700];
+            memcpy(cand, b, L);
+            cand[L] = 0;
+            struct stat st;
+            if (stat(cand, &st) == 0 && S_ISREG(st.st_mode)) {
+                snprintf(out, cap, "%s", cand);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int try_video_direct(const char *task) {
+    if (!task || task[0] == '{') return 0;
+    char path[700];
+    if (!find_video_path(task, path, sizeof(path))) return 0;
+
+    plugin_desc_t *pl = find_plugin("video");
+    if (!pl) return 0;
+
+    char op[24] = {0}, mode[16] = "fill";   /* 默认用背景色覆盖：不动画面位置，比 crop 的拉伸安全 */
+    if (strstr(task, "竖屏") || strstr(task, "垂直")) {
+        snprintf(op, sizeof(op), "portrait");
+        if (strstr(task, "模糊") || strstr(task, "blur")) snprintf(mode, sizeof(mode), "blur");
+        else if (strstr(task, "黑边") || strstr(task, "留边")) snprintf(mode, sizeof(mode), "pad");
+    } else if (strstr(task, "去字幕") || strstr(task, "去除字幕") ||
+               strstr(task, "去掉字幕") || strstr(task, "擦掉字幕") ||
+               strstr(task, "字幕")) {
+        snprintf(op, sizeof(op), "desub");
+    } else if (strstr(task, "黑白") || strstr(task, "灰度") || strstr(task, "单色")) {
+        snprintf(op, sizeof(op), "effects");
+    } else if (strstr(task, "压缩") || strstr(task, "变小") || strstr(task, "体积")) {
+        snprintf(op, sizeof(op), "compress");
+    } else if (strstr(task, "信息") || strstr(task, "分辨率") || strstr(task, "多长")) {
+        snprintf(op, sizeof(op), "video_info");
+    } else if (strstr(task, "抽帧") || strstr(task, "截一帧") || strstr(task, "缩略")) {
+        snprintf(op, sizeof(op), "thumb");
+    } else if (strstr(task, "gif") || strstr(task, "GIF")) {
+        snprintf(op, sizeof(op), "gif");
+    } else {
+        return 0;                       /* 动作不明确，交给模型问清楚 */
+    }
+
+    char esc[1400], call[1800];
+    jesc_video(task, esc, sizeof(esc));
+    if (!strcmp(op, "portrait"))
+        snprintf(call, sizeof(call),
+            "{\"op\":\"portrait\",\"path\":\"%s\",\"mode\":\"%s\",\"async\":1}", path, mode);
+    else
+        /* effects 把原话带上，插件自己解析"黑白/淡入/变速"这些词 */
+        snprintf(call, sizeof(call),
+            "{\"op\":\"%s\",\"path\":\"%s\",\"_task\":\"%s\"}", op, path, esc);
+
+    printf("（确定性命中：%s → video.%s）\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path, op);
+    printf("【插件 video 开始工作】\n");
+    fflush(stdout);
+    char *res = pl->run(call);
+    if (!res) return 0;
+    if (strstr(res, "\"error\"")) { free(res); return 0; }   /* 失败就让模型接手 */
+    printf("%s\n", res);
+    free(res);
+    return 1;
+}
+
 int main(int argc, char **argv) {
+    /* AGENT_DIRECT_ANSWER=0 关掉"插件给答案就直接收" */
+    { const char *da = getenv("AGENT_DIRECT_ANSWER");
+      if (da && !strcmp(da, "0")) g_direct_answer = 0; }
     const char *task = NULL;
     const char *model = "qwen2.5-3b-q4_k_m.gguf";
     const char *host = "127.0.0.1";
@@ -1662,6 +2328,9 @@ int main(int argc, char **argv) {
     if (task && try_direct_plugin(task)) return 0;
     if (task && try_math_direct(task)) return 0;
     if (task && try_music_direct(task)) return 0;
+    if (task && try_csv_to_xlsx(task)) return 0;
+    if (task && try_write_article(task, host, port, model)) return 0;
+    if (task && try_video_direct(task)) return 0;
     if (auto_state_only) {
         /* 高频轮询专用：不探测环境、不输出描述，只回状态，几十字节。
          * 页面打开面板时每 2 秒拉一次，用不着重建整个面板。 */
@@ -1854,8 +2523,16 @@ int main(int argc, char **argv) {
         "  然后 → {\"tool\":\"sys\",\"op\":\"shell\",\"cmd\":\"sh /tmp/count404.sh\"}\n"
         "用户：看看最近 20 行日志\n"
         "→ {\"tool\":\"owrt\",\"op\":\"logread\",\"lines\":20}\n"
-        "用户：日志里有没有 error\n"
-        "→ {\"tool\":\"owrt\",\"op\":\"logread\",\"lines\":60,\"key\":\"error\"}\n"
+        "用户：把 /opt/mp4/01.mp4 转成竖屏\n"
+        "→ {\"tool\":\"video\",\"op\":\"portrait\",\"path\":\"/opt/mp4/01.mp4\"}\n"
+        "用户：把这个视频的字幕去掉（保留画面）\n"
+        "→ {\"tool\":\"video\",\"op\":\"desub\",\"path\":\"/opt/mp4/01.mp4\"}\n"
+        "用户：把视频转成黑白\n"
+        "→ {\"tool\":\"video\",\"op\":\"effects\",\"path\":\"/opt/mp4/01.mp4\",\"grayscale\":1}\n"
+        "用户：抓5秒流量，看看访问了什么\n"
+        "→ {\"tool\":\"netcap\",\"op\":\"urls\",\"secs\":5}\n"
+        "用户：看看 /tmp 下最大的文件\n"
+        "→ {\"tool\":\"sys\",\"op\":\"du\",\"path\":\"/tmp\",\"top\":10}\n"
         "用户：抓 http://x/y 看看是不是 404\n"
         "→ {\"tool\":\"sys\",\"op\":\"http_get\",\"url\":\"http://x/y\"}\n"
         "凡是算式、方程、方程组、统计、数论题，一律调用 math 插件，不要心算。\n"
@@ -2036,6 +2713,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  [body] %.500s\n", body);
             fflush(stderr);
         }
+        printf("【模型 推理第 %d 步】\n", step);
+        fflush(stdout);
         char *resp = http_post(host, port, "/v1/chat/completions", body, 300);
         if (getenv("AGENT_DEBUG")) {
             fprintf(stderr, "  [resp] %.400s\n", resp ? resp : "(NULL)");
@@ -2171,12 +2850,25 @@ int main(int argc, char **argv) {
         if (p) {
             char op2[48] = {0};
             json_str_field(content, "op", op2, sizeof(op2));
-            if (op2[0]) {
+
+            /* 歧义 op 不能自动改投：probe 既是 browser 的（探网页）又是 jq 的
+             * （探 JSON），keys/get/query/table/extract/page/csv 同理。
+             * 之前"看看 /tmp 下最大的文件"被模型发成 tool=doc,op=probe，
+             * 这里一改投就落到 jq 头上，jq 去读 JSON → 报"没指定 file"。
+             * 歧义的交给原插件自己报错，比乱改投好。 */
+            static const char *AMB[] = {"probe", "keys", "get", "query", "table",
+                                        "extract", "page", "csv", "info", "jq", NULL};
+            int ambiguous = 0;
+            for (int ai = 0; AMB[ai]; ai++)
+                if (!strcmp(op2, AMB[ai])) { ambiguous = 1; break; }
+
+            if (op2[0] && !ambiguous) {
                 const char *right = op_to_plugin(content, op2);
                 if (right && strcmp(right, tool) != 0) {
                     plugin_desc_t *p2 = find_plugin(right);
                     if (p2) {
-                        printf("  （%s 不是 %s 的 op，自动改投 %s 插件）\n", op2, tool, right);
+                        printf("【插件切换 %s → %s】%s 不是 %s 的 op\n", tool, right, op2, tool);
+                fflush(stdout);
                         p = p2;
                     }
                 }
@@ -2208,12 +2900,22 @@ int main(int argc, char **argv) {
 
         if (cl > 0 && content[cl - 1] == '}') {
             snprintf(enr, sizeof(enr), "%.*s%s,\"_host\":\"%s\",\"_port\":%d,"
-                     "\"_model\":\"%s\"}", (int)(cl - 1), content, extra, host, port, model);
+                     "\"_model\":\"%s\",\"_task\":\"%s\"}",
+                     (int)(cl - 1), content, extra, host, port, model, task_esc);
         } else {
             snprintf(enr, sizeof(enr), "%s", content);
         }
+        printf("【插件 %s 开始工作】\n", p->name);
+        fflush(stdout);
         char *out = p->run(enr);
         free(content);
+        if (out && try_direct_answer(tool, out, step)) {
+            /* 插件已经把答案写清楚了，别再花 100~190 秒让模型复述 */
+            printf("%s\n", out);
+            free(out);
+            rc = 0;
+            break;
+        }
         if (!out) {
             printf("  ! 插件返回空\n");
             continue;

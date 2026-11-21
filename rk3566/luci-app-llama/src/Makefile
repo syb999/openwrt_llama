@@ -15,9 +15,9 @@ CFLAGS  := -O2 -Wall -Wextra -fPIC -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
 LDFLAGS ?= -ldl
 
 # 插件列表：新增插件只要往这里加一行
-PLUGINS := math table batch doc net sysmon owrt sys music curl jsonq browser
+PLUGINS := math table batch doc net netcap video sysmon owrt sys music curl jsonq browser
 
-all: agent cgi $(PLUGINS:%=plugins/%.so)
+all: agent cgi mediad desub_fill desub_shot $(PLUGINS:%=plugins/%.so)
 
 # luci.mk 的 Build/Compile 调的是 `make clean compile`
 compile: all
@@ -31,6 +31,15 @@ test: all
 
 # --wrap 把框架内的 malloc/free 接到 memcheck.c 的记账版本（--memcheck 模式用）
 WRAP := -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=strdup,--wrap=free
+
+desub_fill: desub_fill.c
+	$(CC) $(CFLAGS) -o $@ desub_fill.c $(LDFLAGS)
+
+desub_shot: desub_shot.c
+	$(CC) $(CFLAGS) -o $@ desub_shot.c $(LDFLAGS)
+
+mediad: media.c
+	$(CC) $(CFLAGS) -o $@ media.c $(LDFLAGS)
 
 agent: agent.c json.c memcheck.c plugin.h json.h
 	$(CC) $(CFLAGS) -o $@ agent.c json.c memcheck.c -lm $(WRAP) $(LDFLAGS)
@@ -52,11 +61,14 @@ install: all
 	install -d $(DESTDIR)/www/cgi-bin
 	install -m 755 agent $(DESTDIR)/opt/llama/agent/agent-c
 	install -m 755 cgi   $(DESTDIR)/www/cgi-bin/agent
+	install -m 755 mediad $(DESTDIR)/opt/llama/agent/mediad
+	install -m 755 desub_fill $(DESTDIR)/opt/llama/agent/desub_fill
+	install -m 755 desub_shot $(DESTDIR)/opt/llama/agent/desub_shot
 	install -m 755 $(PLUGINS:%=plugins/%.so) $(DESTDIR)/opt/llama/agent/plugins/
 	install -m 755 memstat.sh $(DESTDIR)/opt/llama/agent/
 
 clean:
-	rm -f agent cgi $(PLUGINS:%=plugins/%.so) tests/test_math tests/test_json tests/test_plugin tests/test_doc
+	rm -f agent cgi mediad desub_fill desub_shot $(PLUGINS:%=plugins/%.so) tests/test_math tests/test_json tests/test_plugin tests/test_doc
 
 .PHONY: all compile install clean test
 

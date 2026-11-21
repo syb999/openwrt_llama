@@ -804,6 +804,8 @@ static void do_file(const char *fname) {
      * 少列一条就是"有下载按钮但点了说文件不存在"。 */
     snprintf(cand[nc++], 700, "%s/downloads/%s", WORK_DIR, base);
     snprintf(cand[nc++], 700, "%s/gen/%s", WORK_DIR, base);
+    /* 视频产物在磁盘上（/tmp 是 tmpfs，放不下大文件） */
+    snprintf(cand[nc++], 700, "/opt/llama/out/%s", base);
     /* browser 插件失败时截的现场图 */
     snprintf(cand[nc++], 700, "%s/shots/%s", WORK_DIR, base);
     for (int d = 0; d <= KEEP_DAYS; d++) {
@@ -834,24 +836,67 @@ static void do_file(const char *fname) {
         else if (!strcasecmp(ext, ".jpg") || !strcasecmp(ext, ".jpeg")) { ct = "image/jpeg"; is_img = 1; }
         else if (!strcasecmp(ext, ".gif")) { ct = "image/gif"; is_img = 1; }
         else if (!strcasecmp(ext, ".webp")) { ct = "image/webp"; is_img = 1; }
+        else if (!strcasecmp(ext, ".mp4") || !strcasecmp(ext, ".m4v")) { ct = "video/mp4"; is_img = 1; }
+        else if (!strcasecmp(ext, ".webm")) { ct = "video/webm"; is_img = 1; }
+        else if (!strcasecmp(ext, ".mov")) { ct = "video/quicktime"; is_img = 1; }
+        else if (!strcasecmp(ext, ".mkv")) { ct = "video/x-matroska"; is_img = 1; }
         else if (!strcasecmp(ext, ".txt") || !strcasecmp(ext, ".md") || !strcasecmp(ext, ".py"))
             ct = "text/plain; charset=utf-8";
     }
     struct stat st;
     if (stat(hit, &st) != 0) { out_json("{\"ok\":0,\"error\":\"stat 失败\"}"); return; }
+    /* ---------- Range 支持 ----------
+     * <video> 拖动进度条、Safari 播 mp4 都要求服务器能回 206 Partial Content。
+     * 之前只会整文件 200，表现是"能点开但拖不动 / 手机上黑屏"。 */
+    long long start = 0, end = st.st_size - 1;
+    int partial = 0;
+    const char *range = getenv("HTTP_RANGE");
+    if (range && !strncmp(range, "bytes=", 6)) {
+        const char *r = range + 6;
+        long long s2 = -1, e2 = -1;
+        if (*r == '-') {                       /* bytes=-N 最后 N 字节 */
+            long long n2 = atoll(r + 1);
+            if (n2 > 0) { s2 = st.st_size - n2; if (s2 < 0) s2 = 0; e2 = st.st_size - 1; }
+        } else {
+            s2 = atoll(r);
+            const char *d = strchr(r, '-');
+            if (d && d[1]) e2 = atoll(d + 1);
+            else e2 = st.st_size - 1;
+        }
+        if (s2 >= 0 && s2 < st.st_size && e2 >= s2) {
+            if (e2 >= st.st_size) e2 = st.st_size - 1;
+            start = s2;
+            end = e2;
+            partial = 1;
+        }
+    }
+
+    if (partial)
+        printf("Status: 206 Partial Content\r\n");
     printf("Content-Type: %s\r\n", ct);
-    /* 图片给 inline —— 页面里要用 <img src="...?file=x.png"> 直接显示；
-     * 其它类型还是 attachment，点了就下载 */
+    /* 图片/视频给 inline —— 页面里要直接 <img>/<video src>；其它类型仍走下载 */
     printf("Content-Disposition: %s; filename=\"%s\"\r\n",
            is_img ? "inline" : "attachment", base);
-    printf("Content-Length: %lld\r\n", (long long)st.st_size);
+    printf("Accept-Ranges: bytes\r\n");
+    if (partial)
+        printf("Content-Range: bytes %lld-%lld/%lld\r\n",
+               start, end, (long long)st.st_size);
+    printf("Content-Length: %lld\r\n", end - start + 1);
     printf("Cache-Control: no-store\r\n\r\n");
     fflush(stdout);
+
     FILE *f = fopen(hit, "rb");
     if (!f) return;
-    char buf[8192];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) fwrite(buf, 1, n, stdout);
+    if (fseeko(f, (off_t)start, SEEK_SET) != 0) { fclose(f); return; }
+    long long left = end - start + 1;
+    char buf[32768];
+    while (left > 0) {
+        size_t want = (size_t)(left > (long long)sizeof(buf) ? (long long)sizeof(buf) : left);
+        size_t n = fread(buf, 1, want, f);
+        if (n == 0) break;
+        fwrite(buf, 1, n, stdout);
+        left -= (long long)n;
+    }
     fclose(f);
     fflush(stdout);
 }
@@ -862,6 +907,77 @@ int main(void) {
     const char *qs = getenv("QUERY_STRING");
     if (!method) method = "GET";
     if (!qs) qs = "";
+
+    /* ?vprog=<id> —— 查视频后台任务的进度。
+     * 这是给页面进度条用的轻量接口：不经过模型、不占 agent 单任务锁，
+     * 每秒轮询一次也就读两个小文件。 */
+    if (strncmp(qs, "vprog=", 6) == 0) {
+        char id[80];
+        snprintf(id, sizeof(id), "%s", qs + 6);
+        char *amp = strchr(id, '&');
+        if (amp) *amp = 0;
+
+        char jp[256], pp[256];
+        snprintf(jp, sizeof(jp), "/tmp/llama_agent/vjobs/%s.json", id);
+        snprintf(pp, sizeof(pp), "/tmp/llama_agent/vjobs/%s.prog", id);
+
+        FILE *f = fopen(jp, "r");
+        if (!f) { out_json("{\"ok\":0,\"error\":\"no such job\"}"); return 0; }
+        char jb[600] = {0};
+        size_t jn = fread(jb, 1, sizeof(jb) - 1, f);
+        jb[jn] = 0;
+        fclose(f);
+
+        int pid = 0;
+        double total = 0, done = 0;
+        int ended = 0;
+        char out[512] = {0};
+        const char *q;
+        if ((q = strstr(jb, "\"pid\":"))) pid = atoi(q + 6);
+        if ((q = strstr(jb, "\"total\":"))) total = atof(q + 8);
+        if ((q = strstr(jb, "\"out\":\""))) {
+            q += 7;
+            size_t i = 0;
+            while (*q && *q != '"' && i + 1 < sizeof(out)) out[i++] = *q++;
+            out[i] = 0;
+        }
+        f = fopen(pp, "r");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                if (!strncmp(line, "out_time_us=", 12)) done = atof(line + 12) / 1000000.0;
+                else if (!strncmp(line, "out_time_ms=", 12)) done = atof(line + 12) / 1000000.0;
+                if (strstr(line, "progress=end")) ended = 1;
+            }
+            fclose(f);
+        }
+        int alive = 0;
+        if (pid > 0) {
+            char kp[64];
+            snprintf(kp, sizeof(kp), "/proc/%d", pid);
+            alive = (access(kp, F_OK) == 0);
+        }
+        struct stat st;
+        long long sz = (stat(out, &st) == 0) ? (long long)st.st_size : 0;
+        int pct = (total > 0) ? (int)(done * 100.0 / total) : (ended ? 100 : 0);
+        if (pct > 100) pct = 100;
+        const char *state = ended ? "done" : (alive ? "running" : "stopped");
+        out_json("{\"ok\":1,\"pct\":%d,\"state\":\"%s\",\"done_sec\":%.1f,"
+                 "\"total_sec\":%.1f,\"size\":%lld,\"out\":\"%s\"}",
+                 pct, state, done, total, sz, out);
+        return 0;
+    }
+
+    /* 临时诊断：?envdump=1 打出所有 CGI 环境变量 —— 用来确认 uhttpd 到底
+     * 有没有把 Range 这类请求头传给 CGI */
+    if (strstr(qs, "envdump=1")) {
+        printf("Content-Type: text/plain\r\n\r\n");
+        extern char **environ;
+        for (char **e = environ; *e; e++)
+            if (!strncmp(*e, "HTTP_", 5) || !strncmp(*e, "REQUEST_", 8))
+                printf("%s\n", *e);
+        return 0;
+    }
 
     mkdir_p(JOBS);
     prune_jobs();

@@ -266,7 +266,40 @@ static int run_jq_raw(const char *expr, const char *file, char *out, size_t cap)
 
 
 /* 找文件：给了就用给的，没给就用 downloads 里最新的 json */
+static char g_auto_file[900];
+static long g_auto_age;
+
+/* 自动选中的文件超过 30 分钟就不用：宁可让用户补参数，也别拿旧数据编答案 */
+#define AUTO_MAX_AGE 1800L
+
+static int auto_too_old(const char *path, size_t cap) {
+    (void)path; (void)cap;
+    return g_auto_file[0] && g_auto_age > AUTO_MAX_AGE;
+}
+
+static const char *auto_too_old_msg(void) {
+    static char m[600];
+    snprintf(m, sizeof(m),
+             "没指定 file。downloads 里最新的是 %ld 分钟前的 `%s`，"
+             "多半不是你要的数据 —— 请明确给 file 参数（或先重新抓数据）",
+             g_auto_age / 60, g_auto_file);
+    return m;
+}
+
+static const char *auto_note(void) {
+    static char m[400];
+    if (!g_auto_file[0]) return "";
+    snprintf(m, sizeof(m), "\n\n> 数据源：`%s`（%ld 分钟前，你没指定 file，自动选的）",
+             g_auto_file, g_auto_age / 60);
+    return m;
+}
+
+/* 没给 file 时会退到"downloads 里最新的 json"。这很危险：用户问一个新问题，
+ * 它会拿半小时前抓的无关数据当源，输出一张看着很像样的表 —— 比报错更糟。
+ * 这里把"自动选中了哪个、多久以前的"记下来，调用方据此拒绝或明确标注。 */
 static int resolve_file(const char *in, char *out, size_t cap) {
+    g_auto_file[0] = 0;
+    g_auto_age = 0;
     if (in && in[0]) {
         if (in[0] == '/') snprintf(out, cap, "%s", in);
         else snprintf(out, cap, "%s/downloads/%s", WORK_DIR, in);
@@ -286,6 +319,11 @@ static int resolve_file(const char *in, char *out, size_t cap) {
         struct stat st;
         if (stat(p, &st) != 0) continue;
         if (st.st_mtime >= best) { best = st.st_mtime; snprintf(out, cap, "%s", p); }
+    }
+    if (out[0]) {
+        struct stat st2;
+        snprintf(g_auto_file, sizeof(g_auto_file), "%s", out);
+        g_auto_age = (stat(out, &st2) == 0) ? (long)(time(NULL) - st2.st_mtime) : 0;
     }
     closedir(d);
     return out[0] ? 0 : -1;
@@ -312,6 +350,7 @@ static char *op_probe(const char *json) {
     char path[900];
     if (resolve_file(fname, path, sizeof(path)) != 0)
         return jerr("没有可用的 json 文件（先抓数据，或给 file 参数）");
+    if (auto_too_old(path, sizeof(path))) return jerr(auto_too_old_msg());
     if (!looks_json(path)) return jerr("这个文件不是 JSON");
 
     char *out = malloc(OUTMAX);
@@ -444,9 +483,21 @@ static char *run(const char *json_in) {
     if (!strcmp(op, "query"))
         return op_get(json_in);
     /* 没写 op：有 query/offset 当取值，只有 path 当探测 */
-    if (strstr(json_in, "\"query\"") || strstr(json_in, "\"offset\""))
-        return op_get(json_in);
-    return op_probe(json_in);
+    if (!op[0]) {
+        if (strstr(json_in, "\"query\"") || strstr(json_in, "\"offset\""))
+            return op_get(json_in);
+        return op_probe(json_in);
+    }
+    /* 写了 op 但不认识：不要静默当成 probe —— 那会去读一份无关的旧 json，
+     * 输出一张看着很正常的表，比报错更难发现。 */
+    {
+        char m[400];
+        snprintf(m, sizeof(m),
+                 "不支持的 op：%s。jq 只认 probe / get / query / table / csv / keys / extract / page。"
+                 "取字段用 {\"op\":\"query\",\"file\":\"x.json\",\"query\":\".name\"}；"
+                 "看结构用 {\"op\":\"probe\",\"file\":\"x.json\"}", op);
+        return jerr(m);
+    }
 }
 
 static plugin_desc_t desc = {

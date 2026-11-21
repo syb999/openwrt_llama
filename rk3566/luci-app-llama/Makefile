@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-llama
-PKG_VERSION:=2.0.39
+PKG_VERSION:=2.8.3
 PKG_RELEASE:=1
 # ⚠ luci.mk 会忽略 PKG_RELEASE（它按 VERSION:=$(PKG_VERSION) 打 ipk），
 #   所以每次改代码必须递增 PKG_VERSION 的最后一位（2.0.9 → 2.0.10 …），

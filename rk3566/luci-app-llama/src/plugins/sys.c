@@ -126,7 +126,7 @@ static void resolve_path(const char *in, char *out, size_t cap) {
 static int is_sensitive(const char *path) {
     static const char *dirs[] = {
         "/etc", "/rom", "/usr", "/bin", "/sbin", "/lib", "/root",
-        "/overlay/upper", "/opt/llama", NULL
+        "/overlay/upper", "/opt/llama", "/opt/mp4", NULL
     };
     for (int i = 0; dirs[i]; i++) {
         size_t L = strlen(dirs[i]);
@@ -419,12 +419,36 @@ static char *op_list(const char *json) {
 }
 
 /* ---------------- du ---------------- */
+/* 走目录时顺手记下最大的几个文件 —— 用户问"哪个文件最大"，只给目录总和
+ * 就是答非所问。 */
+#define TOPN 8
+static struct { char path[512]; long long size; } g_topfile[TOPN];
+static int g_ntopfile;
+
+static void topfile_push(const char *path, long long sz) {
+    if (sz <= 0) return;
+    if (g_ntopfile < TOPN) {
+        snprintf(g_topfile[g_ntopfile].path, sizeof(g_topfile[0].path), "%s", path);
+        g_topfile[g_ntopfile].size = sz;
+        g_ntopfile++;
+        return;
+    }
+    int mi = 0;
+    for (int i = 1; i < g_ntopfile; i++)
+        if (g_topfile[i].size < g_topfile[mi].size) mi = i;
+    if (sz > g_topfile[mi].size) {
+        snprintf(g_topfile[mi].path, sizeof(g_topfile[0].path), "%s", path);
+        g_topfile[mi].size = sz;
+    }
+}
+
 static long long walk_size(const char *path, int depth, long long *files) {
     if (depth > 8) return 0;
     struct stat st;
     if (lstat(path, &st) != 0) return 0;
     if (!S_ISDIR(st.st_mode)) {
         if (files) (*files)++;
+        topfile_push(path, (long long)st.st_size);
         return (long long)st.st_size;
     }
     DIR *d = opendir(path);
@@ -456,15 +480,44 @@ static char *op_du(const char *json) {
     }
 
     long long files = 0;
+    g_ntopfile = 0;
     long long total = walk_size(path, 0, &files);
 
-    char text[1200];
-    snprintf(text, sizeof(text),
+    /* 按大小降序 */
+    for (int a = 0; a < g_ntopfile; a++)
+        for (int b = a + 1; b < g_ntopfile; b++)
+            if (g_topfile[b].size > g_topfile[a].size) {
+                char tp[512];
+                long long ts = g_topfile[a].size;
+                snprintf(tp, sizeof(tp), "%s", g_topfile[a].path);
+                snprintf(g_topfile[a].path, sizeof(g_topfile[0].path), "%s", g_topfile[b].path);
+                g_topfile[a].size = g_topfile[b].size;
+                snprintf(g_topfile[b].path, sizeof(g_topfile[0].path), "%s", tp);
+                g_topfile[b].size = ts;
+            }
+
+    char text[3500];
+    size_t i = (size_t)snprintf(text, sizeof(text),
         "**%s**\n\n| 项 | 值 |\n|---|---|\n"
-        "| 总大小 | %.2f MB |\n| 文件数 | %lld |\n",
+        "| 总大小 | %.2f MB |\n| 文件数 | %lld |\n\n",
         path, total / 1048576.0, files);
-    char ans[200];
-    snprintf(ans, sizeof(ans), "%s 共 %.2f MB / %lld 个文件", path, total / 1048576.0, files);
+    if (g_ntopfile > 0) {
+        i += (size_t)snprintf(text + i, sizeof(text) - i,
+            "**最大的文件**\n\n| # | 文件 | 大小 |\n|---|---|---|\n");
+        int show = g_ntopfile < 8 ? g_ntopfile : 8;
+        for (int k = 0; k < show && i < sizeof(text) - 300; k++)
+            i += (size_t)snprintf(text + i, sizeof(text) - i,
+                "| %d | `%s` | %.2f MB |\n", k + 1,
+                g_topfile[k].path, g_topfile[k].size / 1048576.0);
+    }
+    char ans[300];
+    if (g_ntopfile > 0)
+        snprintf(ans, sizeof(ans), "%s 共 %.2f MB / %lld 个文件；最大的是 %s（%.2f MB）",
+                 path, total / 1048576.0, files, strrchr(g_topfile[0].path, '/') ?
+                 strrchr(g_topfile[0].path, '/') + 1 : g_topfile[0].path,
+                 g_topfile[0].size / 1048576.0);
+    else
+        snprintf(ans, sizeof(ans), "%s 共 %.2f MB / %lld 个文件", path, total / 1048576.0, files);
     return jpair(text, ans);
 }
 
@@ -596,6 +649,29 @@ static char *op_write(const char *json) {
             "拒绝写入 %s：这是系统目录（/etc /usr /rom /root 等）。"
             "要改系统配置请用 owrt 插件的 uci 操作。", path);
         return jerr(m);
+    }
+
+    /* 覆盖保护：已经存在的媒体文件不许被 sys.write 覆盖。
+     * 实测事故：模型把 "ffmpeg -i x.mp4 ..." 这条命令当成文件内容，
+     * 用 {"op":"write","path":"/opt/mp4/01.mp4","content":"ffmpeg ..."}
+     * 把 81MB 的源视频覆盖成了 66 字节。文本写文本是自己的事，
+     * 拿文本覆盖视频/音频/图片不是。 */
+    {
+        static const char *media[] = {".mp4", ".mkv", ".mov", ".m4v", ".avi", ".flv", ".ts",
+                                      ".webm", ".mp3", ".wav", ".flac", ".ogg", ".m4a",
+                                      ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
+                                      ".xlsx", ".docx", ".pptx", ".pdf", NULL};
+        struct stat mst;
+        if (stat(path, &mst) == 0) {
+            const char *dot = strrchr(path, '.');
+            if (dot) {
+                for (int i = 0; media[i]; i++) {
+                    if (!strcasecmp(dot, media[i]))
+                        return jerr("拒绝覆盖已有的媒体文件（要重新生成请换个输出路径，"
+                                    "或先用 sys shell 明确删除）");
+                }
+            }
+        }
     }
 
     /* 建父目录 */

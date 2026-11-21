@@ -117,28 +117,13 @@ static char *op_table(const char *json) {
     if (limit <= 0) limit = 15;
     if (limit > 100) limit = 100;
 
-    /* 找文件：没指定就用 downloads 里最新的 json（"上面的文件"就是它） */
+    /* 找文件：和 op_probe 走同一套逻辑（含"自动选的最新文件太旧就拒绝"） */
     char path[900] = {0};
-    if (fname[0]) {
-        if (fname[0] == '/') snprintf(path, sizeof(path), "%s", fname);
-        else snprintf(path, sizeof(path), "%s/downloads/%s", WORK_DIR, fname);
-    } else {
-        DIR *d = opendir(WORK_DIR "/downloads");
-        if (!d) return jerr("没有 downloads 目录，先用 curl 抓数据");
-        time_t best = 0;
-        struct dirent *e;
-        while ((e = readdir(d)) != NULL) {
-            if (e->d_name[0] == '.') continue;
-            if (!strstr(e->d_name, ".json")) continue;
-            char p2[900];
-            snprintf(p2, sizeof(p2), "%s/downloads/%s", WORK_DIR, e->d_name);
-            struct stat st;
-            if (stat(p2, &st) != 0) continue;
-            if (st.st_mtime >= best) { best = st.st_mtime; snprintf(path, sizeof(path), "%s", p2); }
-        }
-        closedir(d);
-        if (!path[0]) return jerr("downloads 里没有 json 文件");
+    if (resolve_file(fname, path, sizeof(path)) != 0) {
+        if (!fname[0]) return jerr("没有 downloads 目录，先用 curl 抓数据");
+        return jerr("文件不存在");
     }
+    if (auto_too_old(path, sizeof(path))) return jerr(auto_too_old_msg());
     struct stat st;
     if (stat(path, &st) != 0) return jerr("文件不存在");
 
@@ -396,6 +381,18 @@ static char *op_table(const char *json) {
     int rows = 0, cols = 0;
     char *md = csv_to_markdown(csvp, 12, (int)limit, &rows, &cols);
     if (!md) return jerr("CSV 生成成功但读不回来");
+
+    /* 自动选的源（用户没给 file）要在结果里写明，否则他会以为这是我们瞎编的 */
+    if (g_auto_file[0]) {
+        size_t need = strlen(md) + 300;
+        char *md2 = malloc(need);
+        if (md2) {
+            snprintf(md2, need, "%s\n\n> 数据源：`%s`（%ld 分钟前，你没指定 file，自动选的）",
+                     md, g_auto_file, g_auto_age / 60);
+            free(md);
+            md = md2;
+        }
+    }
 
     char ans[360];
     snprintf(ans, sizeof(ans), "从 %s 取出 %d 条 × %d 个字段%s",
