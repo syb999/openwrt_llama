@@ -8,7 +8,10 @@ Frames go through: decode -> text mask (bbox in the bottom band) -> 512x512
 MI-GAN inference (rknn) -> paste only the repaired box -> encode.
 """
 import argparse
+import collections
 import os
+import queue
+import threading
 import shutil
 import subprocess
 import sys
@@ -316,6 +319,10 @@ def main():
     ap.add_argument('--feather', type=int, default=6, help='边界羽化宽度（像素）')
     ap.add_argument('--margin', type=int, default=8, help='掩码外再扩一圈，吞掉编码振铃')
     ap.add_argument('--absorb', action='store_true', help='再做一遍残余吸收（慢，通常不需要）')
+    ap.add_argument('--no-thread', action='store_true', help='关掉流水线重叠（同步跑，调试用）')
+    ap.add_argument('--no-reuse', action='store_true', help='关掉逐句复用')
+    ap.add_argument('--reuse-mask', type=float, default=0.03, help='复用：掩码变化阈值')
+    ap.add_argument('--reuse-bg', type=float, default=6.0, help='复用：背景平均差阈值')
     ap.add_argument('--flat-thr', type=float, default=13.0, help='纯色底判定阈值')
     ap.add_argument('--noise', action='store_true', help='纯色底填充时加匹配噪声（默认不加）')
     ap.add_argument('--lc-radius', type=int, default=12, help='局部对比度的邻域半径')
@@ -362,26 +369,112 @@ def main():
     n = 0
     tstate = {}          # 跨帧状态：掩码并集 / 迟滞 / 填充色 EMA
     t_npu = 0.0
-    worker = None        # 常驻推理进程（模型只加载一次）
+    cache = None         # 逐句复用：上一帧修好的补丁
+    pending = collections.deque()
 
-    def get_worker():
-        """懒启动常驻推理进程：模型加载一次，之后逐帧喂 512x512 数据。"""
-        nonlocal worker
-        if worker is not None:
-            return worker
-        env = dict(os.environ)
-        env['LD_LIBRARY_PATH'] = a.libpath
-        if os.path.exists(a.loader):
-            cmd = [a.loader, a.bin, a.model, 'x', 'x', 'x', 'inv', 'loop']
+    class NpuWorker:
+        """常驻推理进程 + 后台线程。
+
+        NPU 本身是单线程的，重叠的意义是：主线程在准备第 N+1 帧（掩码/背景/
+        羽化，约 0.6s）时，后台线程正在等第 N 帧的推理结果（1.15s），
+        两者并行 → 每帧从 1.75s 降到 1.15s。
+        """
+        def __init__(self, args):
+            self.a = args
+            self.proc = None
+            self.qin = queue.Queue(maxsize=3)
+            self.qout = queue.Queue(maxsize=3)
+            self.th = threading.Thread(target=self._loop, daemon=True)
+            self.th.start()
+
+        def _spawn(self):
+            env = dict(os.environ)
+            env['LD_LIBRARY_PATH'] = self.a.libpath
+            if os.path.exists(self.a.loader):
+                cmd = [self.a.loader, self.a.bin, self.a.model, 'x', 'x', 'x', 'inv', 'loop']
+            else:
+                cmd = [self.a.bin, self.a.model, 'x', 'x', 'x', 'inv', 'loop']
+            # migan_rknn 是 glibc 二进制（librknnrt 也是），本系统是 musl，
+            # 必须用 /opt/glibc 的 loader 启动并指定 LD_LIBRARY_PATH。
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL, env=env)
+
+        def _loop(self):
+            fsz = SZ * SZ * 3
+            while True:
+                item = self.qin.get()
+                if item is None:
+                    break
+                img, msk = item
+                out = b''
+                try:
+                    if self.proc is None:
+                        self._spawn()
+                    self.proc.stdin.write(img)
+                    self.proc.stdin.write(msk)
+                    self.proc.stdin.flush()
+                    out = self.proc.stdout.read(fsz)
+                except Exception:
+                    self.proc = None
+                    out = b''
+                self.qout.put(out)
+
+        def submit(self, img, msk):
+            self.qin.put((img, msk))
+
+        def collect(self):
+            return self.qout.get()
+
+        def close(self):
+            self.qin.put(None)
+            if self.proc is not None:
+                try:
+                    self.proc.stdin.close()
+                    self.proc.wait(timeout=5)
+                except Exception:
+                    pass
+
+    npu = NpuWorker(a)
+
+    def paste(ctx, gen, hole_used):
+        small = resize(gen, W, H)
+        hw = resize(hole_used.astype(np.uint8)[..., None] * 255, W, H)[..., 0] > 127
+        fw.write(feather_blend(ctx['frame'], small, hw, a.feather).tobytes())
+
+    def finish(ctx, gen):
+        """跑色调对齐 → 贴回，并把结果存进复用缓存。"""
+        nonlocal cache
+        g2, hh = match_background(gen, ctx['big'], ctx['hole'], ctx['ring'],
+                                  a.flat_thr, a.noise, state=tstate, absorb=a.absorb)
+        paste(ctx, g2, hh)
+        cache = {'hole': hh, 'gen': g2, 'big': ctx['big']}
+
+    def flush_one():
+        ent = pending.popleft()
+        if ent['kind'] == 'npu':
+            outb = npu.collect()
+            if len(outb) == fsz:
+                finish(ent['ctx'], np.frombuffer(outb, dtype=np.uint8).reshape(SZ, SZ, 3))
+            else:
+                sys.stderr.write('inference failed (short read)\n')
+                fw.write(ent['ctx']['frame'].tobytes())
+        elif ent['kind'] == 'reuse':
+            paste(ent['ctx'], ent['gen'], ent['hole'])
+        elif ent['kind'] == 'flat':
+            g2 = ent['ctx']['big'].copy()
+            g2, hh = match_background(g2, ent['ctx']['big'], ent['ctx']['hole'],
+                                      ent['ctx']['ring'], a.flat_thr, a.noise,
+                                      state=tstate, absorb=a.absorb)
+            paste(ent['ctx'], g2, hh)
         else:
-            cmd = [a.bin, a.model, 'x', 'x', 'x', 'inv', 'loop']
-        try:
-            worker = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                      stderr=subprocess.DEVNULL, env=env)
-        except Exception as exc:
-            sys.stderr.write('worker spawn failed: %s\n' % exc)
-            worker = None
-        return worker
+            fw.write(ent['ctx']['frame'].tobytes())
+
+    def push(entry):
+        """入队；保持最多 2 帧在途，超出就按顺序吐出一个（保证输出帧序）。"""
+        pending.append(entry)
+        while len(pending) >= 2:
+            flush_one()
+
     while True:
         buf = dec.read(W * H * 3)
         if len(buf) < W * H * 3:
@@ -408,7 +501,7 @@ def main():
 
         if npx < 60 and tstate.get('hold', 0) <= 0:
             tstate['hole'] = None
-            fw.write(frame.tobytes())
+            push({'kind': 'none', 'ctx': {'frame': frame}})
         else:
             big = resize(frame, SZ, SZ)
 
@@ -417,7 +510,7 @@ def main():
             if prev_hole is not None:
                 hole = hole | prev_hole
             if hole.sum() < 30:            # 掩码为空（迟滞刚触发），原样输出
-                fw.write(frame.tobytes())
+                push({'kind': 'none', 'ctx': {'frame': frame}})
                 n += 1
                 continue
             hole = dilate(hole, a.dilate)
@@ -438,62 +531,42 @@ def main():
             keep_box[by1:by2, bx1:bx2] = True
             ring &= keep_box
 
-            # 先判断背景是不是纯色/渐变：纯色底最终用的是"局部背景估计"，
-            # 模型输出会被整体丢弃 —— 那就没必要白跑一次 1.6s 的 NPU 推理。
-            flat = ring_std(big, ring) < a.flat_thr
-            if flat:
+            ctx = {'frame': frame, 'big': big, 'hole': hole, 'ring': ring}
+
+            # 纯色/渐变底：最终用的是"局部背景估计"，模型输出会被整体丢弃，
+            # 没必要白跑一次 1.15s 的 NPU 推理。
+            # 加 3 个色阶的迟滞：ring_std 在阈值附近抖动时不要反复换填充方式，
+            # 否则两条路径的色差会在成片里表现为"突然亮一下"（实测 9 个色阶）。
+            rs = ring_std(big, ring)
+            mode = tstate.get('mode', 'flat' if rs < a.flat_thr else 'npu')
+            if mode == 'flat' and rs > a.flat_thr + 3.0:
+                mode = 'npu'
+            elif mode == 'npu' and rs < a.flat_thr - 3.0:
+                mode = 'flat'
+            tstate['mode'] = mode
+
+            if mode == 'flat':
                 tstate['skip'] = tstate.get('skip', 0) + 1
-                gen, hole = match_background(big.copy(), big, hole, ring, a.flat_thr,
-                                             a.noise, state=tstate, absorb=a.absorb)
+                push({'kind': 'flat', 'ctx': ctx})
+            elif (cache is not None and not a.no_reuse
+                  and (hole != cache['hole']).mean() < a.reuse_mask
+                  and float(np.abs(big[int(SZ * a.band):] -
+                                   cache['big'][int(SZ * a.band):]).mean()) < a.reuse_bg):
+                # 逐句复用：文字遮罩没变、背景带几乎没变 → 直接贴上一帧修好的补丁。
+                # 台词通常停 1~3 秒，这几帧不必重算，省推理又天然不抖。
+                tstate['reuse'] = tstate.get('reuse', 0) + 1
+                push({'kind': 'reuse', 'ctx': ctx, 'gen': cache['gen'],
+                      'hole': cache['hole']})
             else:
                 tstate['npu'] = tstate.get('npu', 0) + 1
                 keep = np.where(hole, 0, 255).astype(np.uint8)
                 erased = big.copy()
                 erased[hole] = 127
-
-                # migan_rknn 是 glibc 二进制（librknnrt 也是 glibc），本系统是 musl，
-                # 必须用 /opt/glibc 里的 loader 启动，并让它找到 librknnrt.so。
-                # 常驻进程送一帧（模型不重载）；失败则回退到单次调用
-                w = get_worker()
-                _t0 = time.time()
-                outb = b''
-                if w is not None:
-                    try:
-                        w.stdin.write(erased.tobytes())
-                        w.stdin.write(keep.tobytes())
-                        w.stdin.flush()
-                        outb = w.stdout.read(fsz)
-                    except Exception as exc:
-                        sys.stderr.write('worker io failed: %s\n' % exc)
-                        outb = b''
-                        worker = None
-                if len(outb) != fsz:
-                    env = dict(os.environ)
-                    env['LD_LIBRARY_PATH'] = a.libpath
-                    if os.path.exists(a.loader):
-                        cmd = [a.loader, a.bin, a.model, p_img, p_msk, p_out, 'inv']
-                    else:
-                        cmd = [a.bin, a.model, p_img, p_msk, p_out, 'inv']
-                    open(p_img, 'wb').write(erased.tobytes())
-                    open(p_msk, 'wb').write(keep.tobytes())
-                    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
-                    if r.returncode != 0:
-                        t_npu += time.time() - _t0
-                        sys.stderr.write('inference failed: %s\n' % r.stderr[-300:])
-                        fw.write(frame.tobytes())
-                        n += 1
-                        continue
-                    outb = open(p_out, 'rb').read(fsz)
-                t_npu += time.time() - _t0
-                gen = np.frombuffer(outb, dtype=np.uint8).reshape(SZ, SZ, 3)
-                gen, hole = match_background(gen, big, hole, ring, a.flat_thr, a.noise,
-                                             state=tstate, absorb=a.absorb)
-
-            small = resize(gen, W, H)
-            hw = resize(hole.astype(np.uint8)[..., None] * 255, W, H)[..., 0] > 127
-            # 羽化拼接：边界渐变，避免出现修补区的硬边框
-            out = feather_blend(frame, small, hw, a.feather)
-            fw.write(out.tobytes())
+                npu.submit(erased.tobytes(), keep.tobytes())
+                push({'kind': 'npu', 'ctx': ctx})
+                if a.no_thread:
+                    while pending:
+                        flush_one()
 
         n += 1
         if n % 25 == 0:
@@ -501,23 +574,32 @@ def main():
         if a.frames and n >= a.frames:
             break
 
+    while pending:
+        flush_one()
+    npu.close()
+
     dec.close()
     fw.close()
-    if worker is not None:
-        try:
-            worker.stdin.close()
-            worker.wait(timeout=10)
-        except Exception:
-            pass
 
-    r = subprocess.run([a.ffmpeg, '-y', '-v', 'error', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
-                        '-s', '%dx%d' % (W, H), '-r', '%.6f' % fps, '-i', rawpath,
-                        '-c:v', 'h264_rkmpp', '-pix_fmt', 'nv12', '-b:v', a.bitrate,
-                        '-an', a.out])
+    # 音轨从原片直接复制过来（-map 1:a? 表示"有音轨就带上，没有也不报错"）。
+    # 视频是从处理后的裸帧重新编码的，音频不重新编码 → 原片声音原样保留。
+    enc_cmd = [a.ffmpeg, '-y', '-v', 'error',
+               '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+               '-s', '%dx%d' % (W, H), '-r', '%.6f' % fps, '-i', rawpath]
+    if a.inp:
+        enc_cmd += ['-i', a.inp, '-map', '0:v:0', '-map', '1:a?', '-c:a', 'copy']
+    enc_cmd += ['-c:v', 'h264_rkmpp', '-pix_fmt', 'nv12', '-b:v', a.bitrate]
+    # 只处理前 N 帧时，音频要比视频短，否则播放器会以为还有画面
+    if a.frames and fps > 0:
+        enc_cmd += ['-t', '%.3f' % (n / fps)]
+    else:
+        enc_cmd += ['-shortest']
+    enc_cmd += [a.out]
+    r = subprocess.run(enc_cmd)
     if r.returncode != 0:
         sys.stderr.write('encode failed (rc=%d)\n' % r.returncode)
     shutil.rmtree(d, ignore_errors=True)
-    sys.stderr.write('NPU=%d 跳过=%d  NPU耗时=%.1fs\n' % (tstate.get('npu',0), tstate.get('skip',0), t_npu))
+    sys.stderr.write('NPU=%d 复用=%d 纯色跳过=%d\n' % (tstate.get('npu',0), tstate.get('reuse',0), tstate.get('skip',0)))
     sys.stderr.write('done: %d frames -> %s\n' % (n, a.out))
 
 

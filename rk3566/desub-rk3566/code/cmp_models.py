@@ -7,15 +7,20 @@ import os
 import subprocess
 import sys
 
+import importlib.util
 import numpy as np
 
-sys.path.insert(0, '/opt/desub')
-import desub_npu as D
+DESUB_DIR = os.environ.get('DESUB_DIR', os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, DESUB_DIR)
+_spec = importlib.util.spec_from_file_location(
+    'desub_rk3566', os.path.join(DESUB_DIR, 'desub-rk3566.py'))
+D = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(D)
 
 SZ = 512
 FF = '/usr/bin/ffmpeg-rkrga'
 LOADER = '/opt/glibc/ld-linux-aarch64.so.1'
-BIN = '/opt/desub/migan_rknn'
+BIN = os.path.join(DESUB_DIR, 'migan_rknn')
 ENV = dict(os.environ, LD_LIBRARY_PATH='/opt/glibc:/opt/rknpu')
 
 vid = '/opt/mp4/03.mp4'

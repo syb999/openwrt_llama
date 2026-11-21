@@ -1,4 +1,4 @@
-# JP TV Box 3566 · NPU 视频去字幕
+# desub-rk3566 · JP TV Box 3566 NPU 视频去字幕
 
 RK3566（0.8 TOPS NPU）上跑 MI-GAN 图像修复，把视频里的烧录字幕去掉。
 全部在板子上离线处理，不依赖云端。
@@ -7,7 +7,7 @@ RK3566（0.8 TOPS NPU）上跑 MI-GAN 图像修复，把视频里的烧录字幕
 
 ```
 code/
-  desub_npu.py      主流水线：解码 → 掩码 → NPU 修补 → 贴回 → 编码
+  desub-rk3566.py   主流水线：解码 → 掩码 → NPU 修补 → 贴回 → 编码
   migan_rknn.c      推理运行器 C 源码（三种模式：单次 / loop / perf）
   graph_opt.py      ONNX 图优化：删 clip(±256)、把 √2 折进卷积
   convert_migan.py  ONNX → RKNN 转换（fp16，含校准集生成）
@@ -33,13 +33,19 @@ firmware/
 
 ## 板子上的部署
 
-文件放在 `/opt/desub/`（overlay，刷机不保留配置会丢）。
+文件放在 `/opt/desub-rk3566/`（overlay，刷机不保留配置会丢）。
 
 ```sh
-python3 /opt/desub/desub_npu.py <输入.mp4> <输出.mp4> \
-    --model /opt/desub/migan_noclip.rknn \
-    --bin /opt/desub/migan_rknn
+python3 /opt/desub-rk3566/desub-rk3566.py <输入.mp4> <输出.mp4> \
+    --model /opt/desub-rk3566/migan_noclip.rknn \
+    --bin /opt/desub-rk3566/migan_rknn
 ```
+
+**音轨**：视频是从处理后的裸帧重新编码的（h264_rkmpp），音频用
+`-map 1:a? -c:a copy` 从原片**直接流复制**，不重新编码 —— 实测处理前后的
+采样数、峰值、RMS 完全一致。原片没有音轨时也不报错。
+
+**只处理前 N 帧时**（`--frames`）会自动加 `-t`，把音频截到与视频等长。
 
 可选参数（默认值是验证过的画质配置）：
 
@@ -77,16 +83,40 @@ python3 + numpy                   musl 版
 ## 性能（250 帧 576×432）
 
 ```
-总耗时        337 s
-  NPU        189.7 s（165 帧 × 1.15 s，其余帧走纯色底跳过推理）
-  Python     147 s（0.59 s/帧）
-模型计算量    14.8 GFLOP/帧 → 1.15s 意味着约 13 GOPS 有效吞吐
+总耗时        216 s（最初 738 s，优化 3.4 倍）
+  NPU 推理   139 帧（其余帧靠"逐句复用"省掉推理）
+  逐句复用   41 帧
 ```
 
-逐层耗时（perf 模式）：Conv+ConvLeaky 613ms(55%) / Add 249ms / Mul 91ms /
-LeakyRelu 72ms / ConvTranspose 56ms。
+| 优化 | 手段 | 效果 |
+|---|---|---|
+| 删 65 个 `clip(±256)` | 逐层耗时显示它占 274ms，实测是空操作 | 1.55s → 1.15s/帧 |
+| 常驻推理进程 | 模型只加载一次，逐帧走管道 | 省 0.3s/帧 |
+| 流水线重叠 | 后台线程等 NPU，主线程准备下一帧 | 再省 ~0.4s/帧 |
+| 逐句复用 | 文字/背景没变就贴上一帧的补丁 | 再省 41 帧推理 |
+| 掩码半分辨率 | box_blur 是 O(N)，256² 快 4 倍 | 216ms → 90ms |
+| 背景估计 1/4 分辨率 | 背景是低频的 | 快 16 倍 |
+| 羽化只算包围盒 | 全图算 422ms | → 120ms |
+| resize 索引缓存 + 可分离 | 4 次全图 gather | 253ms → 70ms |
 
-**提速历史**：2.95 s/帧 → 1.19 s/帧
+逐层耗时（perf 模式）：Conv+ConvLeaky 613ms(55%) / Add 249ms / Mul 91ms /
+LeakyRelu 72ms / ConvTranspose 56ms。**模型计算量 14.8 GFLOP/帧**，
+1.15s 对应约 13 GOPS —— 对 0.8 TOPS 的 RKNPU1 属于合理水平（所有算子都在 NPU 上，
+`RKNN_QUERY_PERF_DETAIL` 显示 CPUTime=0）。
+
+## 两个提速开关
+
+```sh
+--no-thread     关掉流水线重叠（同步跑，调试用）
+--no-reuse      关掉逐句复用
+--reuse-bg 6    复用背景差阈值（调大=复用更狠、快但可能与新场景不符）
+--reuse-mask 0.03  复用掩码变化阈值
+```
+
+纯色/纹理模式的切换带 3 个色阶迟滞（`tstate['mode']`），
+否则 ring_std 在阈值附近抖动时会在两条填充路径间来回切，成片里表现为"突然亮一下"。
+
+**提速历史**：2.95 s/帧 → 0.86 s/帧
 - 删 65 个 `clip(±256)`（实测是空操作）：1.55s → 1.15s
 - 常驻推理进程（模型只加载一次）：省 0.3s/帧
 - 掩码检测降到半分辨率、背景估计降到 1/4、羽化只算包围盒、resize 缓存索引
@@ -111,14 +141,14 @@ LeakyRelu 72ms / ConvTranspose 56ms。
 python3 one.py /opt/mp4/03.mp4 5.4 /tmp/out.png
 
 # 抖动量化（处理后应 ≤ 原始素材自身抖动）
-python3 flicker.py /opt/desub/03_desub.mp4 5.4 10
+python3 flicker.py /opt/desub-rk3566/03_desub.mp4 5.4 10
 
 # 全片跳变扫描
-python3 scan.py /opt/desub/03_desub.mp4
+python3 scan.py /opt/desub-rk3566/03_desub.mp4
 
 # 逐层耗时
 LD_LIBRARY_PATH=/opt/glibc:/opt/rknpu /opt/glibc/ld-linux-aarch64.so.1 \
-  /opt/desub/migan_rknn model.rknn img.rgb mask.gray out.rgb inv perf
+  /opt/desub-rk3566/migan_rknn model.rknn img.rgb mask.gray out.rgb inv perf
 
 # 模型对比
 python3 cmp_models.py old.rknn new.rknn 2.2 4.0 5.4 7.0
