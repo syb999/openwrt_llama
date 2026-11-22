@@ -12,7 +12,7 @@ PKG_MAINTAINER:=local
 LUCI_TITLE:=LuCI app for local llama.cpp inference
 LUCI_DESCRIPTION:=llama-server (GGUF, pure CPU) plus a login-free page at /llama.htm \
  with a C agent: 11 plugins (math / curl / jq / doc / sys / net / owrt / music / batch / table / sysmon)
-LUCI_DEPENDS:=+luci-base +zlib +jq-full +curl +python3-light +desub-rk3566 +llama.cpp
+LUCI_DEPENDS:=+luci-base +zlib +jq-full +curl +python3-light +desub-rk3566 +llama.cpp +sr-rk3566
 
 # 包里带 aarch64 二进制（C agent），不能标 all
 LUCI_PKGARCH:=aarch64_cortex-a53

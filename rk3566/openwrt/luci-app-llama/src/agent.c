@@ -991,7 +991,7 @@ static const route_t ROUTES[] = {
     {"video",  "视频|竖屏|横屏|转码|压缩视频|压缩.*视频|mp4|MP4|抽帧|缩略图|截图.*视频|"
                "GIF|gif|特效|水印|淡入|淡出|变速|播放|合并.*视频|视频.*合并|切片|分段|"
                "提取音轨|静音|场景检测|黑屏|转成mkv|转成mov|去字幕|去除字幕|字幕|"
-               "去掉字幕|擦掉.*字幕"},
+               "去掉字幕|擦掉.*字幕|超分|画面优化|提升画质|变清晰|清晰度"},
     {"netcap", "抓包|tcpdump|pcap|sniff|"
                "抓.{0,4}秒|抓.{0,6}流量|流量.{0,8}(访问|看看|哪些)|"
                "访问了什么|访问了哪些|访问哪些网站|谁在占带宽|带宽占用"},
@@ -1087,6 +1087,7 @@ static const char *op_to_plugin(const char *js, const char *op) {
         {"split","video"}, {"sheet","video"}, {"convert","video"},
         {"detect","video"}, {"job","video"},
         {"desub","video"}, {"delogo","video"}, {"nsub","video"},
+        {"sr","video"}, {"upscale","video"}, {"enhance","video"}, {"sr2x","video"},
         {"uci_show","owrt"}, {"uci_changes","owrt"}, {"uci_delete","owrt"},
         {"uci_add_list","owrt"}, {"uci_del_list","owrt"}, {"uci_revert","owrt"},
         {"iwinfo","owrt"}, {"iw","owrt"}, {"service","owrt"}, {"logread","owrt"},
@@ -2255,6 +2256,10 @@ static int try_video_direct(const char *task) {
                strstr(task, "去掉字幕") || strstr(task, "擦掉字幕") ||
                strstr(task, "字幕")) {
         snprintf(op, sizeof(op), "desub");
+    } else if (strstr(task, "超分") || strstr(task, "画面优化") || strstr(task, "提升画质") ||
+               strstr(task, "变清晰") || strstr(task, "清晰") || strstr(task, "清晰度") ||
+               strstr(task, "放大")) {
+        snprintf(op, sizeof(op), "sr");
     } else if (strstr(task, "黑白") || strstr(task, "灰度") || strstr(task, "单色")) {
         snprintf(op, sizeof(op), "effects");
     } else if (strstr(task, "压缩") || strstr(task, "变小") || strstr(task, "体积")) {
