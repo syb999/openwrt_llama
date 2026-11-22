@@ -2123,6 +2123,24 @@
       });
   }
 
+  /* 从输入里估算这次要多少 token。
+     中文 1 字 ≈ 1.6~2 token（Qwen2.5 分词），写死 1024 会让"500 字"的文章
+     在半截被截断，而且模型自己不知道 —— 用户看到的就是"后面的字没了"。
+     这里按用户点明的字数放大，上限 3072（ctx 8192 足够）。 */
+  function wantTokens(txt){
+    var s = String(txt || "");
+    var chars = 0;
+    var m = s.match(/(\d{2,5})\s*字/);
+    if (m) chars = parseInt(m[1], 10) || 0;
+    if (!chars){
+      var cn = {"一":1,"二":2,"两":2,"三":3,"四":4,"五":5,"六":6,"七":7,"八":8,"九":9};
+      var mm = s.match(/([一二两三四五六七八九])\s*([百千])\s*字/);
+      if (mm) chars = cn[mm[1]] * (mm[2] === "百" ? 100 : 1000);
+    }
+    if (chars < 200) return 1024;
+    return Math.min(3072, Math.round(chars * 2.0) + 200);
+  }
+
   function send(){
     var text = input.value.trim();
     if (!text || busy) return;
@@ -2137,10 +2155,10 @@
     setBusy(true);
     setTps("");
 
-    var t0 = 0, nChunks = 0, acc = "";
+    var t0 = 0, nChunks = 0, acc = "", finishReason = "";
     var body = {
       messages: [{role:"system", content:SYSTEM}].concat(history.slice(-6)),
-      stream: true, max_tokens: 1024, temperature: 0.7, top_p: 0.9,
+      stream: true, max_tokens: wantTokens(text), temperature: 0.7, top_p: 0.9,
       /* 0.5B 很容易把同一段代码复读十几遍，默认 repeat_penalty 是 1.0（不惩罚） */
       repeat_penalty: 1.15, repeat_last_n: 256, frequency_penalty: 0.3
     };
@@ -2168,6 +2186,8 @@
             var j;
             try { j = JSON.parse(payload); } catch(e){ continue; }
             var d = j.choices && j.choices[0] && j.choices[0].delta;
+            var fr = j.choices && j.choices[0] && j.choices[0].finish_reason;
+            if (fr) finishReason = fr;
             var piece = (d && d.content) || "";
             if (piece){
               if (!t0) t0 = performance.now();
@@ -2206,6 +2226,11 @@
       if (t0 && nChunks){
         var s = (performance.now() - t0) / 1000;
         if (s > 0.5) setTps((acc.length / s).toFixed(1) + " 字/s");
+      }
+      /* finish_reason=length 表示被 max_tokens 截断（不是模型写完了）。
+         以前这种情况静默发生，用户只会觉得"后面的字没了"。 */
+      if (finishReason === "length"){
+        toast("输出达到长度上限被截断，可以说「继续写」接着生成", 5000);
       }
       if (err && err !== "__stop__" && err !== "401"){
         toast(err === "HTTP 503" ? "模型还在加载，稍等再发" : ("请求失败：" + err), 4000);
@@ -2410,6 +2435,7 @@
         {n: "thumb", d: "抽一帧存 png，at 指定第几秒。", c: "{\"op\": \"thumb\", \"path\": \"/opt/mp4/01.mp4\", \"at\": 10}"},
         {n: "gif", d: "转 GIF：start/duration 选片段，width/fps 控制大小。", c: "{\"op\": \"gif\", \"path\": \"/opt/mp4/01.mp4\", \"start\": 5, \"duration\": 3}"},
         {n: "desub", d: "【AI 去字幕】默认 mode=npu：NPU 上跑 MI-GAN 重建被字盖住的画面（约 1 秒/帧，长片自动后台跑+进度条）。mode=fill 用上方背景色覆盖（适合纯色条字幕，零痕迹秒出）；mode=crop 直接裁掉字幕带。band_y/band_h 可手指定字幕带（像素）。", c: "{\"op\": \"desub\", \"path\": \"/opt/mp4/03.mp4\", \"mode\": \"npu\"}"},
+        {n: "sr", d: "【画面优化 · 2 倍超分】NPU 上跑 Real-ESRGAN animevideov3，把整幅画面变清晰（老片/糊片用）。按源片宽高比自动选模型：4:3 走 288×216 切块、16:9 走 320×180 切块；切块全是原图裁剪不缩放，每块 4 倍后合成 2 倍输出，原音轨流复制。实测约 5 秒/帧（4 块），10 秒短片约 40 分钟；只对 SD 源（720p 以下）有意义，高清片会被拒绝。", c: "{\"op\": \"sr\", \"path\": \"/opt/mp4/06.mp4\"}"},
         {n: "job", d: "查后台任务进度（portrait 加 async:1 后会返回 id）。", c: "{\"op\": \"job\", \"id\": \"portrait_1795169692\"}"}
       ],
       sample: '{"op":"portrait","path":"/opt/mp4/01.mp4","mode":"crop","async":1}',

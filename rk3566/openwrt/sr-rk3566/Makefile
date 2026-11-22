@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=sr-rk3566
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_LICENSE:=MIT
 
@@ -37,6 +37,9 @@ define Package/sr-rk3566/install
 	$(INSTALL_BIN) ./files/anime4k_rknn $(1)/opt/sr-rk3566/
 	$(INSTALL_DATA) ./files/av3_res.rknn $(1)/opt/sr-rk3566/
 	$(INSTALL_DATA) ./files/av3_320x180.rknn $(1)/opt/sr-rk3566/
+	$(INSTALL_DATA) ./files/av3_576x432.rknn $(1)/opt/sr-rk3566/
+	$(INSTALL_DATA) ./files/av3_640x480.rknn $(1)/opt/sr-rk3566/
+	$(INSTALL_DATA) ./files/av3_640x360.rknn $(1)/opt/sr-rk3566/
 	$(INSTALL_DATA) ./files/README.md $(1)/opt/sr-rk3566/
 endef
 

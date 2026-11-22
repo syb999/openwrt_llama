@@ -24,6 +24,12 @@ LOADER = '/opt/glibc/ld-linux-aarch64.so.1'
 LIBPATH = '/opt/glibc:/opt/rknpu'
 FF = '/usr/bin/ffmpeg-rkrga' if os.path.exists('/usr/bin/ffmpeg-rkrga') else 'ffmpeg'
 
+# 块边缘丢弃宽度（源像素）。
+# 模型在块边界做 zero-padding，边缘 M 像素的输出是坏的（偏暗/偏亮/发虚）。
+# 每块只保留中心区域，边缘交给相邻块的中心来补 → 接缝两边都是"好像素"。
+# M 越大越安全但块数越多；16 对 288x216 的块够用。SR_MARGIN=24 可再稳一点。
+TILE_MARGIN = int(os.environ.get('SR_MARGIN', '32'))
+
 MODELS = [
     ('4:3', 4.0 / 3.0, os.path.join(DIR, 'av3_res.rknn'), 288, 216),
     ('16:9', 16.0 / 9.0, os.path.join(DIR, 'av3_320x180.rknn'), 320, 180),
@@ -93,6 +99,31 @@ def main():
     if max(w, h) > 1280 and min(w, h) > 720:
         die('源片 %dx%d 已经是高清，不需要跑超分' % (w, h))
     score, mname, model, tw, th, nx, ny, waste = pick_model(w, h)
+
+    # SR_MODEL=<path>[:<tw>x<th>] 可以直接指定模型（比如你新转的大块模型），
+    # 不用改 MODELS。例：SR_MODEL=/opt/sr-rk3566/av3_576x432.rknn:576x432
+    _sm = os.environ.get('SR_MODEL', '').strip()
+    if _sm:
+        _p, _sz = _sm, None
+        if ':' in _sm and 'x' in _sm.rsplit(':', 1)[1]:
+            _p, _sz = _sm.rsplit(':', 1)
+        if os.path.exists(_p):
+            model = _p
+            mname = os.path.basename(_p)
+            if _sz:
+                try:
+                    tw, th = [int(v) for v in _sz.lower().split('x')]
+                except Exception:
+                    die('SR_MODEL 的尺寸要写成 576x432 这样: %s' % _sz)
+            else:
+                die('用 SR_MODEL 指定外部模型时必须带尺寸，例：%s:576x432' % _p)
+            nx = (w + tw - 1) // tw
+            ny = (h + th - 1) // th
+            waste = (nx * tw * ny * th - w * h) / float(w * h)
+            sys.stderr.write('使用 SR_MODEL: %s（块 %dx%d）\n' % (mname, tw, th))
+        else:
+            die('SR_MODEL 指定的模型不存在: %s' % _p)
+
     if not os.path.exists(model):
         die('模型缺失: %s' % model)
     sys.stderr.write('源 %dx%d %.3ffps DAR=%.3f → 模型 %s（块 %dx%d，%dx%d=%d 块，补齐 %.1f%%）\n'
@@ -110,36 +141,100 @@ def main():
                         '-pix_fmt', 'rgb24', raw_in], check=True)
 
         tw_out, th_out = w * 2, h * 2
+        # SR_MODE=single：整帧一次推理，绝对没有块边界 → 绝对没有接缝。
+        #   做法：把整帧按面积平均降到模型尺寸（288x216 / 320x180），跑一次 4 倍，
+        #   输出正好是源片的 2 倍。代价是源片 1:1 细节先被降采样（整体略软），
+        #   但换来彻底无缝，而且只要 1 次推理（比切块快 4~9 倍）。
+        # SR_MODE=tile（默认）：切块保原图细节，块边界丢弃 M 像素交给邻块中心。
+        single = os.environ.get('SR_MODE', '').lower() in ('1', 'single', 'one')
+        if single:
+            xs, ys, M = [0], [0], 0
+            sys.stderr.write('单块模式（整帧一次推理，无接缝）\n')
+        else:
+            # 块边缘 M 个源像素的模型输出是坏的（模型在块边界做 zero-padding，
+            # 感受野被截断 → 偏暗/偏亮/发虚）。所以每块只保留【中心】部分，
+            # 边缘直接丢弃，由相邻块的中心来补 —— Real-ESRGAN 的标准做法。
+            M = TILE_MARGIN
+            sx = max(1, tw - 2 * M)
+            sy = max(1, th - 2 * M)
+            xs = list(range(0, max(1, w - tw + 1), sx))
+            ys = list(range(0, max(1, h - th + 1), sy))
+            if xs[-1] + tw < w:
+                xs.append(max(0, w - tw))
+            if ys[-1] + th < h:
+                ys.append(max(0, h - th))
+            sys.stderr.write('切块 %dx%d 块（丢弃边缘 %d px）\n' % (len(xs), len(ys), M))
+
+        def fit_tile(img):
+            """整帧 → th×tw（单块模式的输入）：整数比用面积平均，否则最近邻。"""
+            hh, ww = img.shape[:2]
+            f = img.astype(np.float32)
+            if hh % th == 0 and ww % tw == 0:
+                ry, rx = hh // th, ww // tw
+                return f.reshape(th, ry, tw, rx, 3).mean(axis=(1, 3))
+            yi = np.arange(th) * hh // th
+            xi = np.arange(tw) * ww // tw
+            return f[yi][:, xi]
+
+        def fit_out(o4):
+            """模型输出 → (th_out, tw_out)（单块模式：4x 输出约等于 2x 源）。"""
+            H, W = o4.shape[:2]
+            if H == th_out and W == tw_out:
+                return o4.astype(np.float32)
+            yi = np.arange(th_out) * H // th_out
+            xi = np.arange(tw_out) * W // tw_out
+            return o4[yi][:, xi].astype(np.float32)
+
         fin = open(raw_in, 'rb')
         fout = open(raw_out, 'wb')
         n = 0
-        # 每帧切块，块间不重叠；不足的用边缘复制补齐，最后裁掉
         while True:
             buf = fin.read(fsz)
             if len(buf) < fsz:
                 break
             img = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
-            out = np.zeros((th_out, tw_out, 3), np.uint8)
-            for iy in range(ny):
-                for ix in range(nx):
-                    y0, x0 = iy * th, ix * tw
-                    y1, x1 = min(y0 + th, h), min(x0 + tw, w)
-                    tile = img[y0:y1, x0:x1]
-                    if tile.shape[0] < th or tile.shape[1] < tw:
-                        tile = np.pad(tile, ((0, th - tile.shape[0]),
-                                             (0, tw - tile.shape[1]), (0, 0)), mode='edge')
+            out = np.zeros((th_out, tw_out, 3), np.float32)
+            if single:
+                tile = fit_tile(img)
+                np.ascontiguousarray(tile.astype(np.uint8)).tofile(os.path.join(tmp, 't.rgb'))
+                r = subprocess.run([LOADER, BIN, model, os.path.join(tmp, 't.rgb'),
+                                    os.path.join(tmp, 'o.rgb'), str(tw), str(th)],
+                                   env=env, capture_output=True)
+                if r.returncode != 0:
+                    die('推理失败：%s' % r.stderr[-200:])
+                o4 = np.fromfile(os.path.join(tmp, 'o.rgb'), dtype=np.uint8).reshape(th * 4, tw * 4, 3)
+                out = fit_out(o4) + 0.5
+                fout.write(np.clip(out, 0, 255).astype(np.uint8).tobytes())
+                n += 1
+                if n % 25 == 0:
+                    sys.stderr.write('  %d frames\n' % n)
+                continue
+            for y0 in ys:
+                for x0 in xs:
+                    tile = img[y0:y0 + th, x0:x0 + tw]
+                    th_, tw_ = tile.shape[0], tile.shape[1]
+                    if th_ < th or tw_ < tw:
+                        tile = np.pad(tile, ((0, th - th_), (0, tw - tw_), (0, 0)),
+                                      mode='edge')
                     np.ascontiguousarray(tile).tofile(os.path.join(tmp, 't.rgb'))
                     r = subprocess.run([LOADER, BIN, model, os.path.join(tmp, 't.rgb'),
                                         os.path.join(tmp, 'o.rgb'), str(tw), str(th)],
                                        env=env, capture_output=True)
                     if r.returncode != 0:
-                        die('推理失败（块 %d,%d）：%s' % (iy, ix, r.stderr[-200:]))
+                        die('推理失败（块 %d,%d）：%s' % (y0, x0, r.stderr[-200:]))
                     o = np.fromfile(os.path.join(tmp, 'o.rgb'), dtype=np.uint8).reshape(th * 4, tw * 4, 3)
                     half = o.reshape(th * 2, 2, tw * 2, 2, 3).mean(axis=(1, 3))
-                    thh, tww = (y1 - y0) * 2, (x1 - x0) * 2
-                    out[y0 * 2:y0 * 2 + thh, x0 * 2:x0 * 2 + tww] = \
-                        np.clip(half[:thh, :tww] + 0.5, 0, 255).astype(np.uint8)
-            fout.write(out.tobytes())
+                    # 只取"中心"部分：离块的边界 >= M（贴画面外沿的那侧除外）
+                    cx0 = 0 if x0 == 0 else M
+                    cx1 = min(tw_, tw - M) if x0 + tw < w else tw_
+                    cy0 = 0 if y0 == 0 else M
+                    cy1 = min(th_, th - M) if y0 + th < h else th_
+                    if cx1 <= cx0 or cy1 <= cy0:
+                        continue
+                    out[(y0 + cy0) * 2:(y0 + cy1) * 2,
+                        (x0 + cx0) * 2:(x0 + cx1) * 2] = \
+                        half[cy0 * 2:cy1 * 2, cx0 * 2:cx1 * 2] + 0.5
+            fout.write(np.clip(out, 0, 255).astype(np.uint8).tobytes())
             n += 1
             if n % 25 == 0:
                 sys.stderr.write('  %d frames\n' % n)
