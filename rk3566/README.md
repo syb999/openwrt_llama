@@ -1,14 +1,73 @@
-# RK3566 + OpenWrt 跑 Qwen2.5-0.5B-Instruct (GGUF Q4_K_M)
+# RK3566 + OpenWrt 跑本地 LLM（Qwen2.5-3B）+ NPU 视频去字幕
 
-纯 CPU 推理，静态编译，板上无依赖。
+LLM 走纯 CPU 推理，视频修复走 NPU，全部离线，板上无云端依赖。
+
+**推荐配置：Qwen2.5-3B Q4_K_M**（1.95 GiB 权重，4GB 板子实测长期稳定）。
+0.5B / 1.5B 也能跑，速度更快但中文能力明显弱。
 
 ## 1. 环境
 
-构建机：Linux x86_64，cmake >= 3.14，curl，tar。
-交叉编译器：musl.cc GCC 11.2（**必须 >= 11**，见第 5 节）。
-目标板：aarch64 / musl（OpenWrt 21.02+），4 核 Cortex-A55，RAM >= 2GB。
+```
+构建机   Linux x86_64 + 这棵 OpenWrt 21.02 构建树
+工具链   OpenWrt 自带 aarch64_cortex-a53_gcc-8.4.0_musl（不需要外部 musl-cross）
+目标板   RK3566（4×Cortex-A55，支持 dotprod）+ 4GB RAM，OpenWrt 21.02
+```
 
-## 2. 编译
+> **GCC 8.4 编 llama.cpp 1.0.0** 需要三个补丁（在 `package/ai/llama.cpp/patches/`）：
+>
+> | 补丁 | 解决什么 |
+> |---|---|
+> | `001-gcc8-neon-fallback.patch` | `-mcpu=cortex-a55+dotprod` 模式下 GCC 8 的 `arm_neon.h` 没有 `vld1q_u8_x4` / `vld1q_s8_x4` / `vld1_s8_x4`，用普通 `vld1q_*` 补齐（含裸名字，`repack.cpp` 用裸名调用） |
+> | `002-server-iomanip.patch` | `server-context.cpp` 用 `std::setw` 却没 `#include <iomanip>`（GCC 9+ 才是间接包含） |
+> | `003-server-ctad-factory.patch` | GCC 8 不支持 `new field_num(...)` 的类模板实参推导（CTAD），改用 `make_field_num<T>()` 工厂，48 处 |
+>
+> 另外 Makefile 要加 `-DCMAKE_CXX_STANDARD_LIBRARIES="-lstdc++fs"`
+> —— GCC 8 的 `std::filesystem` 在独立库里。
+
+## 2. 编译（编进固件）
+
+三个包都在构建树的 `package/ai/` 下，`.config` 里确认：
+
+```bash
+CONFIG_PACKAGE_llama.cpp=y
+CONFIG_PACKAGE_luci-app-llama=y
+CONFIG_PACKAGE_desub-rk3566=y
+```
+
+```bash
+cd /path/to/openwrt-21.02.5
+make -j4 world     # 这棵树只有 world 目标，没有 make image
+# 产物：bin/targets/rockchip/armv8/openwrt-rockchip-armv8-panther_x2-*-sysupgrade.img.gz
+```
+
+### 性能相关的编译开关（缺一不可）
+
+```make
+# package/ai/llama.cpp/Makefile
+TARGET_CFLAGS   += -O3 -mcpu=cortex-a55+dotprod
+TARGET_CXXFLAGS += -O3 -mcpu=cortex-a55+dotprod
+RSTRIP:=:          # 本树 rstrip.sh 用宿主 strip 会把 aarch64 ELF 的段表抹掉
+```
+
+```
+-mcpu（不是 -march）  同时给指令集和 A55 调度模型 → SDOT 指令 1072 条（-march 只有 542）
+-O3                   GCC 8 代码生成比 GCC 11 弱，优化级别不能再降
+```
+
+实测（3B Q4_K_M，-t 4）：
+
+| 编译方式 | pp512 | tg128 |
+|---|---|---|
+| 不加 -mcpu（a53 基线） | 0.92 | 0.68 |
+| `-march=armv8.2-a+dotprod+fp16` | 2.62 | 1.43 |
+| **`-O3 -mcpu=cortex-a55+dotprod`** | **5.28** | **2.33** |
+
+> ⚠️ `-mcpu=cortex-a55` 的产物**不能跑在真 A53 板子**（RK3399 等）上，会 SIGILL。
+> 只出 RK3566/3568/3588 的镜像就没事。
+
+## 2.5 备选：musl-cross 手工交叉编译
+
+不用 OpenWrt 构建系统时走这条。产物是**静态链接**的独立二进制，不依赖固件，可单独 scp。
 
 ```bash
 chmod +x build.sh
@@ -77,53 +136,106 @@ file llama.cpp/build-musl/bin/llama-cli
 
 ## 3. 模型
 
+推荐 3B（4GB 板子实测稳定）：
+
 ```bash
-curl -L -o qwen2.5-0.5b-instruct-q4_k_m.gguf \
-  "https://modelscope.cn/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/master/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+curl -L -o qwen2.5-3b-q4_k_m.gguf \
+  "https://modelscope.cn/models/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/master/qwen2.5-3b-instruct-q4_k_m.gguf"
+# 1.95 GiB，校验 head -c 4 == GGUF
 ```
 
-校验：`head -c 4` 为 `GGUF`，大小 491,400,032 字节。
+放到 `/opt/llama/qwen2.5-3b-q4_k_m.gguf`，`/etc/config/llama` 的 `model` 指这里。
+
+| 模型 | 大小 | tg128 | 评价 |
+|---|---|---|---|
+| 0.5B | 0.4 GB | 8.0 t/s | 只适合演示 |
+| 1.5B | 1.0 GB | 3.7 t/s | 中文勉强 |
+| **3B** | **2.0 GB** | **2.33 t/s** | **推荐，稳定** |
 
 ## 4. 部署与运行
 
+固件里已经带了 `llama-server` / `llama-cli` / `llama-bench`（都在 `/opt/llama/`），
+**刷机后不用再传二进制**，只缺模型：
+
 ```bash
-# 推文件（模型 469MiB，放 /opt 下，别放 /rom）
-ssh root@10.80.1.125 'mkdir -p /opt/llama'
-cat llama-cli   | ssh root@10.80.1.125 'cat > /opt/llama/llama-cli'
-cat llama-bench | ssh root@10.80.1.125 'cat > /opt/llama/llama-bench'
-cat qwen2.5-0.5b-instruct-q4_k_m.gguf | ssh root@10.80.1.125 'cat > /opt/llama/qwen2.5-0.5b-q4_k_m.gguf'
-ssh root@10.80.1.125 'chmod +x /opt/llama/llama-*'
+scp qwen2.5-3b-q4_k_m.gguf root@10.80.1.125:/opt/llama/qwen2.5-3b-q4_k_m.gguf
+ssh root@10.80.1.125 '/etc/init.d/llama restart'
 ```
+
+（走 `build.sh` 手工编译时才需要把 `llama-cli` / `llama-bench` 用 `cat | ssh` 推上去。）
 
 ```bash
 # 单轮对话
-/opt/llama/llama-cli -m /opt/llama/qwen2.5-0.5b-q4_k_m.gguf \
+/opt/llama/llama-cli -m /opt/llama/qwen2.5-3b-q4_k_m.gguf \
     -st -p "用一句话解释什么是NPU" -n 40 -t 4
 
 # 交互多轮（默认就是多轮，不带 -st 即可；新版没有 -cnv 参数）
-/opt/llama/llama-cli -m /opt/llama/qwen2.5-0.5b-q4_k_m.gguf -t 4
+/opt/llama/llama-cli -m /opt/llama/qwen2.5-3b-q4_k_m.gguf -t 4
 
-# 跑分
-/opt/llama/llama-bench -m /opt/llama/qwen2.5-0.5b-q4_k_m.gguf -t 4 -p 128 -n 64 -r 3
+# 跑分（默认 5 轮很慢，-r 2 够用）
+/opt/llama/llama-bench -m /opt/llama/qwen2.5-3b-q4_k_m.gguf -p 512 -n 128 -r 2 -t 4
 ```
 
 常用参数：
 
 | 参数 | 说明 |
 |---|---|
-| `-t N` | 线程数，4 核给 `-t 4`；板上有别的服务时用 `-t 3` |
-| `-n N` | 生成 token 上限，0.5B 建议 64~256 |
-| `-c N` | 上下文长度，默认 4096；短问答 `-c 1024` 更省内存 |
+| `-t N` | 线程数，4 核给 `-t 4`；同时跑 NPU 去字幕时给 `-t 3` |
+| `-n N` | 生成 token 上限，3B 建议 128~512 |
+| `-c N` | 上下文长度，默认 4096；短问答 `-c 2048` 更省内存 |
 | `-st` | 单轮，生成完退出；不加它就是交互多轮（`-cnv` 已在新版删除） |
 
-## 5. Web 界面（可选）
+## 4.5 NPU 去字幕（desub-rk3566）
 
-`luci-app-llama/` 里是一个 LuCI app，同时提供一个免登录页面。两者共用同一套聊天 UI。
+RK3566 的 0.8 TOPS NPU 上跑 MI-GAN：把视频里的硬字幕抹掉，用真实画面重建。
 
 ```bash
-# 装到设备
-cd luci-app-llama && tar czf - . | ssh root@<设备IP> 'tar xzf - -C /'
-# 把 llama-server 放到 /opt/llama/llama-server，模型放 /opt/llama/
+# 命令行
+python3 /opt/desub-rk3566/desub-rk3566.py 输入.mp4 输出.mp4 --band 0.78
+
+# 网页里（video 插件的 desub op）
+{"op":"desub","path":"/opt/mp4/03.mp4","mode":"npu"}
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--band 0.78` | 字幕带起始位置，**占画面高度的比例**（不是像素）；0.78 = 底部 22% |
+| `--white 45` | 亮文字检测阈值（灰度 − 邻域均值） |
+| `--dilate 10` | 文字掩码膨胀半径（在 512 空间里） |
+| `--model` | 默认 `/opt/desub-rk3566/migan_noclip.rknn` |
+
+实测 576×432 / 250 帧（10 秒）约 4 分钟 ≈ **1 秒/帧**（NPU 真推理 126 次，
+其余帧靠"逐句复用"跳过）。模型和转换流程见 [desub-rk3566/README.md](desub-rk3566/README.md)。
+
+### 前提：cma=512M + THP=never（固件已带）
+
+NPU 用非 IOMMU 模式，要连续内存。默认 `cma=256M` + THP=always 时，
+llama-server 吃掉 2GB 后 CmaFree 直接归零，NPU 初始化就失败
+（`RKNN_ERR_MALLOC_FAIL`）。两处改完才能共存：
+
+```bash
+cat /proc/cmdline | tr ' ' '\n' | grep cma     # 期望 cma=512M rk_video_cma=512M
+cat /sys/kernel/mm/transparent_hugepage/enabled # 期望 [never]
+```
+
+THP=always 会把大块匿名内存变成 2MiB 大页，这个 5.4 内核不支持大页迁移，
+CMA 池回收不掉 → NPU 要连续内存时直接 -EBUSY。关掉之后 llama 常驻 2GB
+也不影响 NPU。
+
+对应固件改动（`kernel/` 目录里也有）：
+
+```
+target/linux/rockchip/image/mmc.bootscript                 rk3566 → cma=512M
+target/linux/rockchip/armv8/base-files/etc/config/thp     mode 'never'
+target/linux/rockchip/armv8/base-files/etc/init.d/thp     开机应用（rc.d/S19thp）
+```
+
+## 5. Web 界面
+
+`package/ai/luci-app-llama/` 是一个 LuCI app，同时提供一个免登录页面。两者共用同一套聊天 UI。
+**刷固件就带了，不用单独装。**
+
+```bash
 /etc/init.d/llama enable
 /etc/init.d/llama start
 ```
@@ -135,6 +247,31 @@ cd luci-app-llama && tar czf - . | ssh root@<设备IP> 'tar xzf - -C /'
 架构：`llama-server` 监听 `0.0.0.0:<port>`（默认 8090），开 `--cors-origins "*"`；
 页面用 `fetch` 走 `/v1/chat/completions`（`stream:true`）做流式输出。
 
+### 5.0 设置面板：插件开关
+
+设置弹窗里列 14 个插件，点行内任意位置即可勾选/取消：
+
+```
+关掉的插件不加载（连 dlopen 都不做，省内存），工具表也变短
+关掉后仍然留在列表里（置灰、写"当前停用（未加载）"），勾上保存即可重开
+写入 /etc/llama.plugoff（一行一个名字），下次任务启动时生效
+```
+
+### 5.0.1 视频插件：结果并排显示原片与处理后
+
+任何"改了视频"的操作（去字幕/竖屏/压缩/裁剪/加水印…）返回的卡片里
+都会**上下两个播放器**：上面原片、下面处理后，方便直接对比。
+
+```
+实现要点：
+  video.c 在结果 JSON 里注入 "src": "<源文件>"（异步任务也带，?vprog 会返回）
+  htm 的 dualPlayers() 渲染两个 <video>，都走 mediad :8091（支持 Range 拖进度）
+  完成态延迟 2 秒再挂播放器 —— ffmpeg 报 done 时还在写 moov，立刻请求会拿到半截文件
+  fill 模式强制 format=yuv420p（overlay format=auto 会产出 yuvj420p，Chrome 直接拒绝）
+```
+
+已知限制：源片是 MPEG-4/DivX 时 Chrome 不能解码，原片框是黑的（输出仍是 H.264，正常）。
+
 ### 5.1 移植到其他设备
 
 app 的 Lua/JS/CGI 部分与架构无关，只有二进制和路径要换。全部通过 UCI 配置，改前端：
@@ -142,14 +279,15 @@ app 的 Lua/JS/CGI 部分与架构无关，只有二进制和路径要换。全�
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `binary` | `/opt/llama/llama-server` | 每台设备自己的 llama-server |
-| `model` | `/opt/llama/qwen2.5-0.5b-q4_k_m.gguf` | 任意 .gguf |
+| `model` | `/opt/llama/qwen2.5-3b-q4_k_m.gguf` | 任意 .gguf |
 | `port` | `8090` | 页面通过 `/cgi-bin/llama` 自动发现，不用改 htm |
 | `threads` | `4` | 按核数调 |
 | `ctx` | `2048` | 按内存调；KV cache 随它涨 |
 | `key_file` | `/etc/llama.key` | 访问口令文件，空=不启用 |
 
-换架构重编 `llama-server`：改 `build.sh` 里的 `TC_URL` 与 `-mcpu`（本仓库 `out/` 里的是
-aarch64/cortex-a55）。32 位 ARM 可用 `musl.cc` 的 `armv7l-linux-musleabihf-cross`；
+换架构重编 `llama-server`：改 `package/ai/llama.cpp/Makefile` 里的
+`-mcpu`（本包给的是 cortex-a55+dotprod），或用 `build.sh` 手工交叉编译。
+32 位 ARM 可用 `musl.cc` 的 `armv7l-linux-musleabihf-cross`；
 MIPS 设备基本没戏（llama.cpp 要 NEON 和大内存）。
 
 **配置只有一个来源：`/etc/config/llama`。** init 脚本、CGI、网页都不带内置默认路径/端口：
@@ -249,7 +387,27 @@ GET  /cgi-bin/agent?job=a1b2c3d4        → {"done":false,"output":"...第 1 步
 页面每 1.5 秒轮询，用步骤卡片显示每次工具调用。**同一时刻只允许一个任务**
 （llama-server 是 np=1，并发只会互相排队，实测 5 个并发慢 8 倍）。
 
-### 7.1 工具
+### 7.0 现在的实现：14 个 C 插件（dlopen）
+
+工具不是内建函数表，而是 `plugins/*.so`，每个插件导出 `plugin_entry()` 自报名字/描述/参数。
+启动时扫描目录 dlopen，**被 `/etc/llama.plugoff` 列到的跳过**（连 dlopen 都不做）。
+
+```
+math    calc 表达式求值                     curl    DevTools 的 curl 原文直发
+jq      JSON 查询/整形                      doc     PDF/Word/Excel/PPT ↔ 文本
+sys     文件读写、系统信息、进程             net     ip/route/ping/dns 诊断
+netcap  tcpdump 抓包分析                    owrt    UCI / 服务 / 防火墙
+music   模板化音乐 + 自写旋律渲染            batch   大任务切小 JSON 分批
+table   表格生成/查询                       sysmon  系统快照
+browser 登录态网站（chrome+selenium）        video   视频处理 + NPU 去字幕
+```
+
+完全确定性的任务（JSON 指令、`.mp4` 路径、csv→xlsx）走 `try_direct_plugin` 直连，
+不经过模型 —— 3B 生成速度 2 t/s，能省一步是一步。
+
+### 7.1 早期 0.5B 版的工具表（历史参考）
+
+> 下面是 0.5B 时代的单体内建工具设计，已被上面的插件框架取代，留作设计思路参考。
 
 | 工具 | 用途 |
 |---|---|
@@ -539,13 +697,36 @@ H 合作中途离开              k*(1/a+1/b) + (t-k)*(1/a) = 1
 
 ## 8. 注意
 
-- 交叉编译器必须 GCC >= 11：OpenWrt 21.02 树内 gcc 8.4 缺 `vld1q_s8_x4`/`vld1q_u8_x4`，
-  且不支持 new 表达式里的 C++17 CTAD，编不过。
-- 必须 `-static`，否则板上找不到 musl 的 `ld-musl-aarch64.so.1`。
+**OpenWrt 构建（当前主线）**
+
+- OpenWrt 21.02 的 gcc 8.4 能编 llama.cpp，但**必须带三个补丁**
+  （NEON 多向量加载 / `<iomanip>` / CTAD），见第 1 节。
 - `GGML_NATIVE=OFF` 必须加，否则按构建机 CPU 生成指令。
-- 只编 `llama-cli` 和 `llama-bench`。编 `llama-app` 需要完整 server 链，会报
-  `cannot find -lllama-server-impl`。
-- `-mcpu=cortex-a55+dotprod` 依据板上 `/proc/cpuinfo` 的 `asimddp`；不要用 `i8mm`（A55 没有）。
-- 新版参数里没有 `-no-cnv`，单轮用 `-st`。
+- **必须 `-O3 -mcpu=cortex-a55+dotprod`**：不加的话不生成 SDOT，
+  Q4_K 点积退化成标量循环，pp512 从 5.28 掉到 0.92（慢 5.7 倍）。
+- **必须 `RSTRIP:=:`**：本树的 `rstrip.sh` 用宿主 strip 处理 aarch64，
+  会把 ELF 段表整个抹掉（产物 0 个段，装上就 `Segmentation fault`）。
+  要减小体积就在 `Package/install` 里用 `$(TARGET_CROSS)strip`，别用宿主 strip。
+- `-mcpu=cortex-a55` 的产物跑不了真 A53（SIGILL）。只出 RK3566/3568/3588 就没事。
+- 包放 `package/ai/` 下，`make` 目标是**路径式**的：写成 `make package/llama.cpp/compile`
+  会报 `No rule to make target`（静默不做事）。正确写法 `make package/ai/llama.cpp/compile`。
+- 这棵树只有 `world` 目标，没有 `make image`。
+
+**NPU / 内存**
+
+- NPU 要连续内存：`cma=512M` + `THP=never`（见 4.5 节）。少一个都会
+  `RKNN_ERR_MALLOC_FAIL`。
+- NPU 初始化对内存状态敏感；被 kill 掉的推理进程不会释放 NPU 内存，
+  需要重启板子才能恢复。
+
+**musl-cross 手工编译（备选路线）**
+
+- 交叉编译器 GCC >= 11（老版本编不过，就是上面那三个补丁在补的东西）。
+- 必须 `-static`，否则板上找不到 `ld-musl-aarch64.so.1`。
+- 只编 `llama-cli` / `llama-bench` / `llama-server`；编 `llama-app` 需要完整
+  server 链，会报 `cannot find -lllama-server-impl`。
+- `-mcpu=cortex-a55+dotprod` 依据 `/proc/cpuinfo` 里的 `asimddp`；
+  不要用 `i8mm`（A55 没有）。
+- 新版没有 `-no-cnv` / `-cnv`，单轮用 `-st`。
 - HF 直连和 hf-mirror 都不通，模型走 ModelScope。
 - 二进制带调试信息约 29MB，`aarch64-linux-musl-strip` 后可缩到约 5MB（`STRIP=1 ./build.sh`）。
