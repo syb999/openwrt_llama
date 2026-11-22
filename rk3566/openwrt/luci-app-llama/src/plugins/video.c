@@ -2248,109 +2248,6 @@ static char *with_src(char *res) {
 }
 #define RET(x) do { char *r__ = (x); return with_src(r__); } while (0)
 
-/* 画面优化（2 倍超分）：Real-ESRGAN animevideov3 跑 RKNPU。
- *
- * 和去字幕完全独立：去字幕是"抹掉字并重建那块画面"，这个是"把整幅画面变清晰"。
- * 按源片宽高比自动选模型（4:3 → 288x216 块，16:9 → 320x180 块），
- * 切块全部是原图裁剪（不缩放），每块 4 倍，拼完缩 2 倍 → 输出 2 倍。
- * 只针对 SD 级源：720p 以上是高清，跑这个只会更慢、不会更好。
- */
-static char *op_sr(const char *json) {
-    g_cur_kind = "sr"; g_cur_label = "画面优化";
-    char p[768] = {0};
-    jget(json, "path", p, sizeof(p));
-    if (!p[0]) return errf("缺少 path（要处理的视频）%s%s", "", "");
-
-    char path[900];
-    resolve_path(p, path, sizeof(path));
-    if (!exists(path)) return errf("文件不存在：%s%s", path, "");
-
-    int sw = 0, sh = 0;
-    probe_size(path, &sw, &sh);
-    if (!sw || !sh) return errf("读不到分辨率%s%s", "", "");
-    if (sw > 1280 || sh > 720) {
-        char msg[200];
-        snprintf(msg, sizeof(msg),
-                 "源片 %dx%d 已经是高清，画面优化只针对 SD 源（720p 以下）", sw, sh);
-        return errf("%s%s", msg, "");
-    }
-
-    const char *py = "/opt/sr-rk3566/sr-rk3566.py";
-    if (access(py, R_OK) != 0)
-        return errf("画面优化未安装（需要 sr-rk3566 包提供 /opt/sr-rk3566/sr-rk3566.py）%s%s", "", "");
-
-    const char *mname = (sw * 9 == sh * 16) ? "16:9" : "4:3";
-    const char *tile = (sw * 9 == sh * 16) ? "320x180" : "288x216";
-
-    char out[900];
-    out_name(path, "sr2x", "mp4", out, sizeof(out));
-
-    double dur = duration_of(path);
-    double fps = fps_of(path);
-    if (fps <= 1) fps = 25;
-    int nfr = (int)(dur * fps + 0.5);
-    if (nfr < 1) nfr = 1;
-
-    char id[64], prog[512], logf[512], cmd[1024], text[800], ans[240], extra[520];
-    snprintf(id, sizeof(id), "sr_%ld", (long)time(NULL));
-    mkdir("/tmp/llama_agent", 0777);
-    mkdir(VJOBS, 0777);
-    snprintf(prog, sizeof(prog), "%s/%s.prog", VJOBS, id);
-    snprintf(logf, sizeof(logf), "%s/%s.log", VJOBS, id);
-    snprintf(cmd, sizeof(cmd), "python3 %s '%s' '%s'", py, path, out);
-
-    double est_min = nfr * 5.2 / 60.0;      /* 实测 5.2 秒/帧（4 块）*/
-
-    int want_async = (int)jget_int(json, "async", 1);
-    if (want_async) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            setsid();
-            int fd = open(logf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) fd = open("/dev/null", O_WRONLY);
-            if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
-            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-            _exit(127);
-        }
-        if (pid < 0) return errf("启动画面优化任务失败%s%s", "", "");
-        g_job_fps = fps;
-        job_record(id, (int)pid, out, dur, "画面优化");
-        snprintf(text, sizeof(text),
-                 "**画面优化已开始（后台）**\n\n| 项 | 值 |\n|---|---|\n"
-                 "| 任务 ID | `%s` |\n| 源片 | `%dx%d`（%s，切块 %s）|\n"
-                 "| 引擎 | Real-ESRGAN animevideov3 on RKNPU |\n"
-                 "| 输出 | `%dx%d` |\n| 帧数 | %d 帧（约 %.0f 分钟）|\n| 文件 | `%s` |\n",
-                 id, sw, sh, mname, tile, sw * 2, sh * 2, nfr, est_min, out);
-        snprintf(ans, sizeof(ans),
-                 "画面优化已开始（%d 帧，约 %.0f 分钟），用 job 查进度", nfr, est_min);
-        snprintf(extra, sizeof(extra),
-                 "\"id\":\"%s\",\"async\":1,\"pid\":%d,\"out\":\"%s\","
-                 "\"total_sec\":%.1f,\"kind\":\"画面优化\"",
-                 id, (int)pid, out, dur);
-        return json_pair(text, ans, extra);
-    }
-
-    int rc = run_pipe_sync(cmd);
-    if (rc != 0) {
-        char msg[400];
-        snprintf(msg, sizeof(msg), "画面优化失败（退出码 %d），见 ", rc);
-        return errf("%s%s", msg, logf);
-    }
-    struct stat sts;
-    memset(&sts, 0, sizeof(sts));
-    stat(out, &sts);
-    snprintf(text, sizeof(text),
-             "**画面优化完成**\n\n| 项 | 值 |\n|---|---|\n"
-             "| 源片 | `%dx%d` → `%dx%d` |\n| 引擎 | Real-ESRGAN animevideov3（NPU）|\n"
-             "| 文件 | `%s`（%.1f MB）|\n",
-             sw, sh, sw * 2, sh * 2, out, sts.st_size / 1048576.0);
-    snprintf(ans, sizeof(ans), "画面优化完成，%.1f MB", sts.st_size / 1048576.0);
-    snprintf(extra, sizeof(extra),
-             "\"path\":\"%s\",\"file\":\"%s\",\"format\":\"mp4\",\"size\":%ld",
-             out, out, (long)sts.st_size);
-    return json_pair(text, ans, extra);
-}
-
 static char *run(const char *json_in) {
     char op[32] = {0};
     g_cur_json = json_in;
@@ -2379,9 +2276,6 @@ static char *run(const char *json_in) {
     if (!strcmp(op, "job") || !strcmp(op, "progress")) RET(op_job(json_in));
     if (!strcmp(op, "desub") || !strcmp(op, "delogo") || !strcmp(op, "nsub"))
         RET(op_desub(json_in));
-    if (!strcmp(op, "sr") || !strcmp(op, "upscale") || !strcmp(op, "enhance") ||
-        !strcmp(op, "qingxi") || !strcmp(op, "sr2x"))
-        RET(op_sr(json_in));
 
     return errf("不支持的 op：%s。video 支持 hw / info / portrait / effects / trim / thumb / gif %s",
                 op, "");
@@ -2393,8 +2287,7 @@ static plugin_desc_t desc = {
     "视频：portrait竖屏(crop/blur/pad) effects特效(黑白=grayscale:1 淡入=fade_in:2 "
     "变速=speed:0.5 调色=brightness/contrast/saturation 暗角=vignette:1 镜像=hflip:1 "
     "文字=text) compress压缩 audio音轨 watermark图片水印 crop/scale crop concat合并 "
-    "split切片 sheet缩略图 convert转封装 detect检测 trim截取 thumb抽帧 gif job查进度 "
-    "sr画面优化(2倍超分,只对SD源) desub去字幕",
+    "split切片 sheet缩略图 convert转封装 detect检测 trim截取 thumb抽帧 gif job查进度",
     "{\"op\":\"portrait\",\"path\":\"/opt/mp4/01.mp4\",\"mode\":\"blur\"}"
     "  或 {\"op\":\"effects\",\"path\":\"/opt/mp4/01.mp4\",\"fade_in\":2,\"brightness\":0.05,\"text\":\"示例\"}"
     "  或 {\"op\":\"hw\"}",

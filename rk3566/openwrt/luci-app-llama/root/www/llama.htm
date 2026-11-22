@@ -2410,7 +2410,6 @@
         {n: "thumb", d: "抽一帧存 png，at 指定第几秒。", c: "{\"op\": \"thumb\", \"path\": \"/opt/mp4/01.mp4\", \"at\": 10}"},
         {n: "gif", d: "转 GIF：start/duration 选片段，width/fps 控制大小。", c: "{\"op\": \"gif\", \"path\": \"/opt/mp4/01.mp4\", \"start\": 5, \"duration\": 3}"},
         {n: "desub", d: "【AI 去字幕】默认 mode=npu：NPU 上跑 MI-GAN 重建被字盖住的画面（约 1 秒/帧，长片自动后台跑+进度条）。mode=fill 用上方背景色覆盖（适合纯色条字幕，零痕迹秒出）；mode=crop 直接裁掉字幕带。band_y/band_h 可手指定字幕带（像素）。", c: "{\"op\": \"desub\", \"path\": \"/opt/mp4/03.mp4\", \"mode\": \"npu\"}"},
-        {n: "sr", d: "【画面优化 · 2 倍超分】NPU 上跑 Real-ESRGAN animevideov3，把整幅画面变清晰（老片/糊片用）。按源片宽高比自动选模型：4:3 走 288×216 切块、16:9 走 320×180 切块；切块全是原图裁剪不缩放，每块 4 倍后合成 2 倍输出，原音轨流复制。实测约 5 秒/帧（4 块），10 秒短片约 40 分钟；只对 SD 源（720p 以下）有意义，高清片会被拒绝。", c: "{\"op\": \"sr\", \"path\": \"/opt/mp4/06.mp4\"}"},
         {n: "job", d: "查后台任务进度（portrait 加 async:1 后会返回 id）。", c: "{\"op\": \"job\", \"id\": \"portrait_1795169692\"}"}
       ],
       sample: '{"op":"portrait","path":"/opt/mp4/01.mp4","mode":"crop","async":1}',
