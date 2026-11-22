@@ -2299,7 +2299,9 @@ static char *op_sr(const char *json) {
     snprintf(logf, sizeof(logf), "%s/%s.log", VJOBS, id);
     snprintf(cmd, sizeof(cmd), "python3 %s '%s' '%s'", py, path, out);
 
-    double est_min = nfr * 12.0 / 60.0;     /* 实测 12 秒/帧（3x3 块，丢弃块边界 32px）*/
+    /* 实测 5.15 秒/帧（576x432 源 + 576x432 大模型 = 1 块，2026-11 实测 25 帧 139 秒）。
+     * 源片比模型还大时会自动切块，那种情况会慢 2 倍以上，这里的估算只覆盖常见情况。 */
+    double est_min = nfr * 5.2 / 60.0;
 
     int want_async = (int)jget_int(json, "async", 1);
     if (want_async) {

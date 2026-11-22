@@ -29,6 +29,35 @@
 #include <strings.h>
 #include <ctype.h>
 
+/* ===== 模型管理：查状态 + 在线下载 =====
+ * 为什么放在 CGI：LuCI 的 CBI 是服务端渲染，页面自己没法下 2GB 文件；
+ * 放在这里 htm 页面也能复用同一套接口。
+ * 下载用 curl 写 <目标>.part，下完改名；进度 = .part 大小 / 预设总长（实测字节数）。 */
+typedef struct { const char *key, *url, *dest; long long total; } mdl_t;
+
+static const mdl_t MDLS[] = {
+    {"qwen2.5-3b-q4_k_m",
+     "https://modelscope.cn/models/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/master/qwen2.5-3b-instruct-q4_k_m.gguf",
+     "/opt/llama/qwen2.5-3b-q4_k_m.gguf", 2104932768LL},
+    {"qwen2.5-1.5b-q4_k_m",
+     "https://modelscope.cn/models/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/master/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+     "/opt/llama/qwen2.5-1.5b-q4_k_m.gguf", 1117320672LL},
+    {"qwen2.5-0.5b-q4_k_m",
+     "https://modelscope.cn/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/master/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+     "/opt/llama/qwen2.5-0.5b-q4_k_m.gguf", 491400032LL},
+    {NULL, NULL, NULL, 0}
+};
+
+static long long fsize_ll(const char *p) {
+    struct stat st;
+    return (stat(p, &st) == 0) ? (long long)st.st_size : -1;
+}
+
+static int pid_alive(long p) {
+    if (p <= 0) return 0;
+    return kill((pid_t)p, 0) == 0;
+}
+
 #define JOBS        "/tmp/agent-jobs"
 #define WORK_DIR    "/tmp/llama_agent"
 #define AGENT_C     "/opt/llama/agent/agent-c"
@@ -273,6 +302,102 @@ static void do_set_plugoff(const char *val) {
     }
     fclose(f);
     out_json("{\"ok\":1,\"disabled\":%d}", n);
+}
+
+/* 模型状态。fmt=text 时给 LuCI 页面用（省得页面里解 JSON），默认输出 JSON。 */
+static void do_model_status(int as_text) {
+    /* 必须先发 CGI 头，否则 uhttpd 直接回 "Bad Gateway / The process did not
+     * produce any response"（内容本身是对的，只是缺 Content-Type）。 */
+    printf(as_text ? "Content-Type: text/plain; charset=utf-8\r\n"
+                   : "Content-Type: application/json; charset=utf-8\r\n");
+    printf("Cache-Control: no-store\r\n");
+    printf("Access-Control-Allow-Origin: *\r\n\r\n");
+
+    char mpath[512] = {0};
+    FILE *pp = popen("uci -q get llama.main.model 2>/dev/null", "r");
+    if (pp) {
+        if (fgets(mpath, sizeof(mpath), pp)) {
+            size_t L = strcspn(mpath, "\r\n");
+            mpath[L] = 0;
+        }
+        pclose(pp);
+    }
+    long long ms = mpath[0] ? fsize_ll(mpath) : -1;
+
+    if (as_text) {
+        printf("model=%s\n", mpath[0] ? mpath : "(未配置)");
+        printf("exists=%d\n", ms > 0 ? 1 : 0);
+        printf("size=%lld\n", ms > 0 ? ms : 0);
+        for (int i = 0; MDLS[i].key; i++) {
+            char part[600], pidf[640];
+            snprintf(part, sizeof(part), "%s.part", MDLS[i].dest);
+            snprintf(pidf, sizeof(pidf), "%s.pid", part);
+            long long have = fsize_ll(MDLS[i].dest);
+            long long ps = fsize_ll(part);
+            long pid = 0;
+            FILE *f = fopen(pidf, "r");
+            if (f) { if (fscanf(f, "%ld", &pid) != 1) pid = 0; fclose(f); }
+            printf("dl=%s total=%lld bytes=%lld pct=%d running=%d done=%d\n",
+                   MDLS[i].key, MDLS[i].total, ps > 0 ? ps : 0,
+                   MDLS[i].total ? (int)((ps > 0 ? ps : 0) * 100 / MDLS[i].total) : 0,
+                   (ps >= 0 && pid_alive(pid)) ? 1 : 0, have > 0 ? 1 : 0);
+        }
+        return;
+    }
+
+    printf("{\"ok\":1,\"model\":{\"path\":\"%s\",\"exists\":%d,\"size\":%lld},\"downloads\":[",
+           mpath, ms > 0 ? 1 : 0, ms > 0 ? ms : 0);
+    for (int i = 0; MDLS[i].key; i++) {
+        char part[600], pidf[640];
+        snprintf(part, sizeof(part), "%s.part", MDLS[i].dest);
+        snprintf(pidf, sizeof(pidf), "%s.pid", part);
+        long long have = fsize_ll(MDLS[i].dest);
+        long long ps = fsize_ll(part);
+        long pid = 0;
+        FILE *f = fopen(pidf, "r");
+        if (f) { if (fscanf(f, "%ld", &pid) != 1) pid = 0; fclose(f); }
+        printf("%s{\"key\":\"%s\",\"dest\":\"%s\",\"total\":%lld,\"bytes\":%lld,"
+               "\"pct\":%d,\"running\":%d,\"done\":%d}",
+               i ? "," : "", MDLS[i].key, MDLS[i].dest, MDLS[i].total,
+               ps > 0 ? ps : 0,
+               MDLS[i].total ? (int)((ps > 0 ? ps : 0) * 100 / MDLS[i].total) : 0,
+               (ps >= 0 && pid_alive(pid)) ? 1 : 0, have > 0 ? 1 : 0);
+    }
+    printf("]}");
+}
+
+/* 启动下载（后台）。key 必须是 MDLS 里的名字。 */
+static void do_model_dl(const char *key) {
+    const mdl_t *m = NULL;
+    for (int i = 0; MDLS[i].key; i++)
+        if (!strcmp(MDLS[i].key, key)) { m = &MDLS[i]; break; }
+    if (!m) { out_json("{\"ok\":0,\"error\":\"未知模型: %s\"}", key); return; }
+
+    if (fsize_ll(m->dest) > 0) {
+        out_json("{\"ok\":1,\"already\":1,\"dest\":\"%s\"}", m->dest);
+        return;
+    }
+    char part[600], pidf[640], cmd[1600];
+    snprintf(part, sizeof(part), "%s.part", m->dest);
+    snprintf(pidf, sizeof(pidf), "%s.pid", part);
+    unlink(pidf);
+    if (!strstr(m->dest, "/opt/llama/")) {
+        out_json("{\"ok\":0,\"error\":\"目标路径异常\"}");
+        return;
+    }
+    /* 直接 & 后台：busybox 没有 setsid 命令（用了会 not found 静默失败），
+     * uhttpd 也不会回收 cgi 的子进程，所以普通后台就够。
+     * 下完才改名，避免半截文件被当成模型加载。 */
+    snprintf(cmd, sizeof(cmd),
+             "sh -c 'echo $$ > %s; "
+             "curl -L --retry 5 --retry-delay 3 --connect-timeout 20 -C - -o %s %s "
+             "&& mv %s %s' >/dev/null 2>&1 &",
+             pidf, part, m->url, part, m->dest);
+    if (system(cmd) != 0) {
+        out_json("{\"ok\":0,\"error\":\"启动下载失败\"}");
+        return;
+    }
+    out_json("{\"ok\":1,\"started\":1,\"dest\":\"%s\",\"total\":%lld}", m->dest, m->total);
 }
 
 static void do_stop_job(void) {
@@ -1095,6 +1220,24 @@ int main(void) {
              * 只能关一个插件，关第二个时文件被清空。 */
             url_decode(pv);
             do_set_plugoff(pv);
+            return 0;
+        }
+        /* 模型管理（LuCI 设置页和 htm 都用）：
+         *   ?model_status=1        查当前模型 + 各预设的下载状态（加 &fmt=text 给 LuCI）
+         *   ?model_dl=<key>        后台下载某个预设模型 */
+        if (pj && strstr(pj, "model_status=")) {
+            do_model_status(strstr(pj, "fmt=text") != NULL);
+            return 0;
+        }
+        if (pj && strstr(pj, "model_dl=")) {
+            const char *v = strstr(pj, "model_dl=") + 9;
+            char mk[80];
+            size_t ml = strcspn(v, "&");
+            if (ml >= sizeof(mk)) ml = sizeof(mk) - 1;
+            memcpy(mk, v, ml);
+            mk[ml] = 0;
+            url_decode(mk);
+            do_model_dl(mk);
             return 0;
         }
     }

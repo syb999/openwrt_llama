@@ -108,6 +108,19 @@ static char *extract_content(const char *resp) {
     return out;
 }
 
+/* 取 finish_reason（"stop" 正常结束 / "length" 撞到 max_tokens 被截断）。
+ * 以前完全没看这个字段：模型写到一半被截断，agent 也当正常结果往下走，
+ * 前端就把半截 JSON（{"tool":"doc","op":"write","content":"# ...）当答案显示出来。 */
+static void extract_finish(const char *resp, char *out, size_t cap) {
+    char err[128];
+    if (out && cap) out[0] = 0;
+    jval *v = json_parse(resp, err, sizeof(err));
+    if (!v) return;
+    const char *fr = json_str(json_get(json_at(json_get(v, "choices"), 0), "finish_reason"));
+    if (fr && out) snprintf(out, cap, "%s", fr);
+    json_free(v);
+}
+
 /* 旧的 strstr 版取值，留着给插件参数这种扁平结构用（新代码别用） */
 __attribute__((unused))
 static const char *skip_ws(const char *p) {
@@ -991,7 +1004,7 @@ static const route_t ROUTES[] = {
     {"video",  "视频|竖屏|横屏|转码|压缩视频|压缩.*视频|mp4|MP4|抽帧|缩略图|截图.*视频|"
                "GIF|gif|特效|水印|淡入|淡出|变速|播放|合并.*视频|视频.*合并|切片|分段|"
                "提取音轨|静音|场景检测|黑屏|转成mkv|转成mov|去字幕|去除字幕|字幕|"
-               "去掉字幕|擦掉.*字幕"},
+               "去掉字幕|擦掉.*字幕|超分|画面优化|提升画质|变清晰|清晰度"},
     {"netcap", "抓包|tcpdump|pcap|sniff|"
                "抓.{0,4}秒|抓.{0,6}流量|流量.{0,8}(访问|看看|哪些)|"
                "访问了什么|访问了哪些|访问哪些网站|谁在占带宽|带宽占用"},
@@ -1087,6 +1100,9 @@ static const char *op_to_plugin(const char *js, const char *op) {
         {"split","video"}, {"sheet","video"}, {"convert","video"},
         {"detect","video"}, {"job","video"},
         {"desub","video"}, {"delogo","video"}, {"nsub","video"},
+        /* 画面优化（2 倍超分）。这四个别名必须留在表里：漏了的话
+           {"op":"sr","path":...} 不会被直连，会退回给模型猜，慢好几倍。 */
+        {"sr","video"}, {"upscale","video"}, {"enhance","video"}, {"sr2x","video"},
         {"uci_show","owrt"}, {"uci_changes","owrt"}, {"uci_delete","owrt"},
         {"uci_add_list","owrt"}, {"uci_del_list","owrt"}, {"uci_revert","owrt"},
         {"iwinfo","owrt"}, {"iw","owrt"}, {"service","owrt"}, {"logread","owrt"},
@@ -1873,10 +1889,21 @@ static int want_chars(const char *t) {
 static int is_article_task(const char *t) {
     int w = strstr(t, "文章") || strstr(t, "作文") || strstr(t, "短文")
          || strstr(t, "报告") || strstr(t, "文案") || strstr(t, "总结")
-         || strstr(t, "演讲稿") || strstr(t, "简介") || strstr(t, "介绍词");
+         || strstr(t, "演讲稿") || strstr(t, "简介") || strstr(t, "介绍词")
+         /* 下面这些之前漏了：用户说"写一篇…教程/指南/说明"，会被当成普通任务，
+            走主线 max_tokens=220，模型把正文塞进工具调用的 JSON 里直接被截断，
+            页面上就显示半截 {"tool":"doc",...} */
+         || strstr(t, "教程") || strstr(t, "指南") || strstr(t, "说明")
+         || strstr(t, "文档") || strstr(t, "方案") || strstr(t, "攻略")
+         || strstr(t, "手册") || strstr(t, "邮件") || strstr(t, "讲稿")
+         || strstr(t, "长文") || strstr(t, "解析") || strstr(t, "评测");
     int a = strstr(t, "写") || strstr(t, "生成") || strstr(t, "来一篇")
-         || strstr(t, "帮我写") || strstr(t, "起草");
-    return w && a;
+         || strstr(t, "帮我写") || strstr(t, "起草") || strstr(t, "拟");
+    if (w && a) return 1;
+    /* 兜底：只要点名了字数（>=100），就当写作任务 —— 名词怎么叫都无所谓。
+       "写一篇…500字左右" 这种说法名词千奇百怪，靠关键词穷举永远漏。 */
+    if (a && want_chars(t) >= 100) return 1;
+    return 0;
 }
 
 /* ---------- 长文分段生成（含 topup 补写）----------
@@ -2255,6 +2282,10 @@ static int try_video_direct(const char *task) {
                strstr(task, "去掉字幕") || strstr(task, "擦掉字幕") ||
                strstr(task, "字幕")) {
         snprintf(op, sizeof(op), "desub");
+    } else if (strstr(task, "超分") || strstr(task, "画面优化") || strstr(task, "提升画质") ||
+               strstr(task, "变清晰") || strstr(task, "清晰") || strstr(task, "清晰度") ||
+               strstr(task, "放大")) {
+        snprintf(op, sizeof(op), "sr");
     } else if (strstr(task, "黑白") || strstr(task, "灰度") || strstr(task, "单色")) {
         snprintf(op, sizeof(op), "effects");
     } else if (strstr(task, "压缩") || strstr(task, "变小") || strstr(task, "体积")) {
@@ -2705,37 +2736,60 @@ int main(int argc, char **argv) {
         if (!log_esc) break;
         json_escape(log, log_esc, lcap);
 
-        char *body = malloc(BIG);
-        if (!body) { free(log_esc); break; }
-        snprintf(body, BIG,
-            "{\"model\":\"%s\",\"messages\":["
-            "{\"role\":\"system\",\"content\":\"%s\"},"
-            "{\"role\":\"user\",\"content\":\"%s\"}],"
-            "\"max_tokens\":%d,\"temperature\":0.3,\"stream\":false}",
-            model, sys_esc, log_esc, is_pure_chat(task) ? 180 : 240);
-        free(log_esc);
-
         time_t t0 = time(NULL);
-        /* 流式：模型每吐一段就写进日志，前端轮询能看到进度。
-         * 以前是一次性等完整响应，三分钟空白让人以为卡死。 */
         /* 一次性请求（非流式）。流式实测会让 llama-server 卡在写阻塞：
          * 唯一 slot 被占死、4 核满载不出结果，后面所有请求排队。
          * 前端有"运行中 XX 秒"的计时，能看出还在跑。 */
-        if (getenv("AGENT_DEBUG")) {
-            fprintf(stderr, "  [body] %.500s\n", body);
-            fflush(stderr);
-        }
         printf("【模型 推理第 %d 步】\n", step);
         fflush(stdout);
-        char *resp = http_post(host, port, "/v1/chat/completions", body, 300);
-        if (getenv("AGENT_DEBUG")) {
-            fprintf(stderr, "  [resp] %.400s\n", resp ? resp : "(NULL)");
-            fflush(stderr);
+
+        /* 发请求 + 截断重试。
+         * 关键：撞到 max_tokens（finish_reason=length）时，拿到的内容是残缺的
+         * —— 工具调用的 JSON 会被从中间劈开。以前这里不看 finish_reason，
+         * 直接把这半截当结果往下走，前端只好把 {"tool":"doc","op":"write",
+         * "content":"# ...  原样显示出来。现在一律丢弃 + 预算翻 4 倍重试。 */
+        char *content = NULL;
+        char fin[24] = {0};
+        int tok = is_pure_chat(task) ? 180 : 240;
+        for (int att = 0; att < 3; att++) {
+            char *body = malloc(BIG);
+            if (!body) { free(log_esc); log_esc = NULL; break; }
+            snprintf(body, BIG,
+                "{\"model\":\"%s\",\"messages\":["
+                "{\"role\":\"system\",\"content\":\"%s\"},"
+                "{\"role\":\"user\",\"content\":\"%s\"}],"
+                "\"max_tokens\":%d,\"temperature\":0.3,\"stream\":false}",
+                model, sys_esc, log_esc, tok);
+            if (getenv("AGENT_DEBUG")) {
+                fprintf(stderr, "  [body] %.400s\n", body);
+                fflush(stderr);
+            }
+            char *resp = http_post(host, port, "/v1/chat/completions", body, 300);
+            free(body);
+            fin[0] = 0;
+            content = resp ? extract_content(resp) : NULL;
+            if (resp) {
+                extract_finish(resp, fin, sizeof(fin));
+                free(resp);
+            }
+            if (content && !strcmp(fin, "length")) {
+                printf("\n⚠ 输出撞到长度上限（%d token）被截断 —— 这段是残缺的，已丢弃并加倍重试\n", tok);
+                free(content);
+                content = NULL;
+                if (tok >= 4000) break;      /* 到顶了，别无限翻 */
+                tok *= 4;
+                continue;
+            }
+            break;
         }
-        char *content = resp ? extract_content(resp) : NULL;
-        if (resp) free(resp);
-        free(body);
+        free(log_esc);
+        log_esc = NULL;
         if (!content) {
+            if (!strcmp(fin, "length")) {
+                printf("\n⚠ 连续 3 次都被长度上限截断。这个任务一次写不完："
+                       "可以说「分几段写」或把目标字数降到 300 以内。\n");
+                break;
+            }
             fprintf(stderr, "llama-server 无有效响应（%s:%d）\n", host, port);
             printf("\n⚠ 模型服务没响应（%s:%d）——不是任务本身失败。"
                    "多半是 llama-server 正在加载模型（装包/重启后要 10~30 秒），"
