@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-llama
-PKG_VERSION:=3.1.54
+PKG_VERSION:=3.1.96
 PKG_RELEASE:=1
 # ⚠ luci.mk 会忽略 PKG_RELEASE（它按 VERSION:=$(PKG_VERSION) 打 ipk），
 #   所以每次改代码必须递增 PKG_VERSION 的最后一位（2.0.9 → 2.0.10 …），
@@ -32,6 +32,15 @@ MAKE_FLAGS += \
 	LDFLAGS=""
 
 include $(TOPDIR)/feeds/luci/luci.mk
+
+define Package/luci-app-llama/postinst
+#!/bin/sh
+# LuCI 的菜单索引有缓存，装了新页面不清缓存就看不到（语音设置那次就是这样）
+rm -f /tmp/luci-indexcache* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+[ -n "$${IPKG_INSTROOT}" ] || /etc/init.d/llama enable >/dev/null 2>&1
+exit 0
+endef
 
 define Package/luci-app-llama/conffiles
 /etc/config/llama
