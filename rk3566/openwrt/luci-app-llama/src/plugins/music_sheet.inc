@@ -588,7 +588,22 @@ static int sheet_to_notes(const char *img, note_t *notes, int *xs, int *uis, int
     for (int s = 0; s < ns && nn < maxn; s++) {
         int sp = st[s].space;
         if (sp < 4) continue;
-        int treble = staff_is_treble(px, w, h, &st[s]);
+        /* 大谱表判定（实测数据驱动）：
+         * 两只老虎那张谱是 5 行 × 2 组 = 10 组，组内和组间的垂直间距几乎一样
+         * （253px 对 272px，都是 ~10 个五线间距，因为歌词占了一行），
+         * 所以"按间距配对"分不开高/低音谱表。
+         * 可靠规则：谱表数成偶数时，按上下顺序奇偶配对 —— 偶数=上行(高音)，奇数=下行(低音)。
+         * 谱表数为奇数（单行谱）时退回按谱号墨迹判断。 */
+        int treble, lower_staff = 0;
+        if (ns % 2 == 0) {
+            treble = (s % 2 == 0) ? 1 : 0;
+            lower_staff = (s % 2 == 1);
+        } else {
+            treble = staff_is_treble(px, w, h, &st[s]);
+        }
+        /* 注意：不能简单地"跳过下行谱表" —— 实测这张谱的符头大部分落在下行，
+         * 一跳就只剩 2 个音。旋律提取要在音符生成之后再按"同一时刻取最高音"做。 */
+        (void)lower_staff;
         /* 按列厚度找符头（谱线不擦：符头骑在线上，擦线会把它切成两半） */
         int nb;
         if (use_model) {
@@ -596,6 +611,7 @@ static int sheet_to_notes(const char *img, note_t *notes, int *xs, int *uis, int
              * u 是时值（1/16 为单位）：先按实心/空心给基础值，
              * 横桁覆盖到的实心符头降成八分（2）。 */
             nb = 0;
+            int stem_heads[4000], nstem = 0;
             for (int mi = 0; mi < nmh && nb < 4000; mi++) {
                 int my = (int)mheads[mi].cy;
                 int mx = (int)mheads[mi].cx;
@@ -620,8 +636,50 @@ static int sheet_to_notes(const char *img, note_t *notes, int *xs, int *uis, int
                         break;
                     }
                 }
+                /* 横桁检不到时用几何判时值：符头左右两侧扫竖列墨迹找符干，
+                 * 有符干 → 至少八分；相邻符干符头间距近 → 两者都判八分 */
+                if (u == 4) {
+                    int has_stem = 0;
+                    for (int side = -1; side <= 1 && !has_stem; side += 2) {
+                        for (int dxp = 1; dxp <= (int)(sp * 0.7f) && !has_stem; dxp++) {
+                            int xr = mx + side * ((int)(sp * 0.35f) + dxp);
+                            if (xr < 0 || xr >= w) continue;
+                            for (int dir = -1; dir <= 1 && !has_stem; dir += 2) {
+                                int run = 0, gap = 0;
+                                for (int k = 1; k < sp * 3; k++) {
+                                    int yy = my + dir * k;
+                                    if (yy < 0 || yy >= h) break;
+                                    if (px[(size_t)yy * w + xr]) { run++; gap = 0; }
+                                    else if (++gap > 3) break;
+                                }
+                                if (run >= (int)(sp * 1.5f)) has_stem = 1;
+                            }
+                        }
+                    }
+                    if (has_stem) {
+                        /* 有符干：先记四分，等间距复核时再把"靠得很近的一对"降成八分 */
+                        if (nstem < 4000) stem_heads[nstem++] = nb;
+                    }
+                }
                 hd[nb].x = mx; hd[nb].y = my; hd[nb].u = u;
                 nb++;
+            }
+            /* stem_heads 存的是处理顺序，必须先按 x 排序，否则"相邻"不是谱面上的相邻 */
+            for (int a = 0; a < nstem; a++)
+                for (int b = a + 1; b < nstem; b++)
+                    if (hd[stem_heads[b]].x < hd[stem_heads[a]].x) {
+                        int t = stem_heads[a]; stem_heads[a] = stem_heads[b]; stem_heads[b] = t;
+                    }
+            {
+                for (int a = 0; a + 1 < nstem; a++) {
+                    int i0 = stem_heads[a], i1 = stem_heads[a + 1];
+                    int gapx = hd[i1].x - hd[i0].x;
+                    if (gapx < 0) gapx = -gapx;          /* 符头未必按 x 排序 */
+                    if (gapx > 0 && gapx < (int)(sp * 3.0f)) {
+                        hd[i0].u = 2;
+                        hd[i1].u = 2;
+                    }
+                }
             }
         } else {
             nb = detect_heads(px, w, h, &st[s], hd, 4000);
@@ -640,6 +698,15 @@ static int sheet_to_notes(const char *img, note_t *notes, int *xs, int *uis, int
             const int *STEPSEL = treble ? STEP_T : STEP_B;
             int midi = (treble ? 64 : 43) + STEPSEL[idx] + 12 * oct;
             if (midi < 36 || midi > 96) continue;
+            /* 取最高声部：同一 x 位置（同一拍）如果有更高的符头，就丢掉这个音。
+             * 钢琴谱里低音伴奏与旋律同拍出现，不筛就会把主旋律盖掉
+             * （两只老虎一直"听不出旋律"就是这原因）。 */
+            int is_low = 0;
+            for (int q = 0; q < ndall; q++) {
+                if (hdall[q].x > hd[i].x - sp && hdall[q].x < hd[i].x + sp &&
+                    hdall[q].y < hd[i].y - sp / 2) { is_low = 1; break; }
+            }
+            if (is_low) continue;
             notes[nn].pitch = midi;
             notes[nn].start = 0;
             notes[nn].dur = 0;
